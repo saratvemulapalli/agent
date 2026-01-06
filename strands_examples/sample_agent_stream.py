@@ -6,6 +6,7 @@ import asyncio
 try:
     from strands import Agent
     from strands.models import BedrockModel
+    from strands_tools import calculator, current_time
 except ImportError:
     print("Error: 'strands-agents' package is not installed.")
     print("Please install it using: pip install strands-agents strands-agents-tools")
@@ -27,7 +28,8 @@ async def main():
         # Initialize the agent
         # callback_handler=None disables the default PrintingCallbackHandler 
         # to prevent double printing of the response
-        agent = Agent(model=model, callback_handler=None)
+        tools = [calculator, current_time]
+        agent = Agent(model=model, tools=tools)
         
     except Exception as e:
         print(f"Failed to initialize agent: {e}")
@@ -56,15 +58,9 @@ async def main():
             stream = agent.stream_async(user_input)
             
             async for event in stream:
-                # Handle reasoning/thinking content if available (e.g. for models that support it)
-                if "reasoningText" in event:
-                    print(event["reasoningText"], end="", flush=True)
-
-                if "data" in event:
-                    # Print the text content
-                    print(event["data"], end="", flush=True)
+                pass
             
-            print() # Print a newline at the end of the response
+            print("")
             
         except KeyboardInterrupt:
             print("\nExiting...")

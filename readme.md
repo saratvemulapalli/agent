@@ -1,0 +1,1 @@
+This repo use `strands` framework to build an OpenSearch semantic search solution architect agent. This agent collect user's requirement and give recommendations for index types. 
