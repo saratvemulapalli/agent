@@ -2,15 +2,12 @@ import os
 import sys
 import asyncio
 
-# Check if strands is installed
-try:
-    from strands import Agent
-    from strands.models import BedrockModel
-    from strands_tools import calculator, current_time
-except ImportError:
-    print("Error: 'strands-agents' package is not installed.")
-    print("Please install it using: pip install strands-agents strands-agents-tools")
-    sys.exit(1)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from strands import Agent
+from strands.models import BedrockModel
+from strands_tools import calculator, current_time
+from scripts.handler import ThinkingCallbackHandler
 
 async def main():
     """
@@ -23,13 +20,23 @@ async def main():
     
     try:
         # Initialize the model
-        model = BedrockModel(model_id=model_id)
+        model = BedrockModel(
+            model_id=model_id,
+            max_tokens=16000,  
+            additional_request_fields={
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 2048,  
+                }
+            }
+        )
         
         # Initialize the agent
         # callback_handler=None disables the default PrintingCallbackHandler 
         # to prevent double printing of the response
         tools = [calculator, current_time]
-        agent = Agent(model=model, tools=tools)
+
+        agent = Agent(model=model, tools=tools, callback_handler=ThinkingCallbackHandler())
         
     except Exception as e:
         print(f"Failed to initialize agent: {e}")
