@@ -68,7 +68,7 @@ BM25 supports several special query types that vector search cannot:
 |---------|---------------|-------|
 | English | 5/5 | Excellent with standard analyzer |
 | Other Languages | 4/5 | Requires language-specific analyzers |
-| Cross-lingual | 1/5 | Not supported natively |
+| Cross-lingual | 0/5 | Not supported natively |
 | CJK Languages | 3/5 | Requires specialized tokenizers (kuromoji, ik, etc.) |
 
 ### 1.7 When to Use BM25

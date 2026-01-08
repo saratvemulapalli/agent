@@ -32,7 +32,7 @@ Your primary goal is to **clarify the user's requirements** for their search app
     *   **Accuracy/Relevance**: What type of matching is needed? (Exact, semantic, hybrid?)
     *   **Update Frequency**: How often is data indexed/updated?
     *   **Filters/Security**: Are there complex filters or document-level security?
-    *   **Deployment**: AWS Managed OpenSearch, self-hosted, etc.?
+    *   **Deployment**: AWS Managed OpenSearch, self-hosted, custom model deployment, etc.?
 
 2.  **Call the Expert**: Once you have sufficient information (or if the user insists on proceeding with what they have), call the `semantic_search_expert_assistant` tool with the summarized requirements.
 
