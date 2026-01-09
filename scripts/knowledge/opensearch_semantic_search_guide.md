@@ -451,14 +451,26 @@ Hybrid search combines multiple retrieval methods (BM25, dense vector, sparse ve
 ### 4.2 Score Normalization
 To combine scores from different methods (e.g., BM25 scores are unbounded, while vector cosine similarity is 0-1), OpenSearch provides several normalization techniques (Min-Max, L2, Harmonic Mean, etc.) to ensure scores are comparable before combination.
 
-### 4.3 When to Use Hybrid Search
+### 4.3 Cost
+- **CPU Load**: The CPU load for a hybrid query is approximately the **sum of the loads** of its sub-queries.
+
+### 4.4 Combination Strategy for Relevance
+When maximum relevance is the primary goal, Hybrid Search is the recommended approach.
+
+- **Recommended Combinations**:
+  - **Dense + BM25**: The most common and effective baseline. Combines semantic understanding with exact keyword precision.
+  - **Dense + Sparse**: Provides two layers of semantic understanding (dense for context, sparse for learned expansion).
+  
+- **Not Recommended**:
+  - **Sparse + BM25**: Generally redundant. Sparse vectors already capture keyword information (lexical match) along with expansion, making the addition of BM25 less impactful for the cost.
+
+### 4.5 When to Use Hybrid Search
 
 **Recommended:**
-- Maximum recall and precision needed
-- Mixed query types (some exact, some semantic)
-- Unknown query distribution
-- Can afford additional infrastructure cost
-- Latency-insensitive applications
+- **Maximum Relevance**: When accuracy and recall are the top priorities.
+- Mixed query types (some exact, some semantic).
+- Unknown query distribution.
+- Can afford additional infrastructure cost (higher CPU load).
 
 **Not Recommended:**
 - Strict cost constraints
