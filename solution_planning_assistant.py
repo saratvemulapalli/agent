@@ -5,24 +5,7 @@ import re
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
-
-# -------------------------------------------------------------------------
-# Tool Definitions
-# -------------------------------------------------------------------------
-
-@tool
-def read_knowledge_base() -> str:
-    """Read the OpenSearch Semantic Search Guide to retrieve detailed information about search methods.
-
-    Returns:
-        str: The content of the guide covering BM25, Dense Vector, Sparse Vector, Hybrid, algorithms (HNSW, IVF, etc.), cost profiles, and deployment options.
-    """
-    try:
-        # Assuming the file is in the same directory or accessible via relative path
-        with open("opensearch_semantic_search_guide.md", "r", encoding="utf-8") as f:
-            return f.read()
-    except Exception as e:
-        return f"Error reading knowledge base: {e}"
+from scripts.tools import read_knowledge_base
 
 # -------------------------------------------------------------------------
 # System Prompt
@@ -90,7 +73,7 @@ You must not claim you performed experiments or accessed external systems. You o
 # -------------------------------------------------------------------------
 
 @tool
-def semantic_search_expert_assistant(context: str) -> str:
+def solution_planning_assistant(context: str) -> str:
     """Act as a semantic search expert assistant to provide technical recommendations based on user context.
 
     Args:
@@ -99,6 +82,7 @@ def semantic_search_expert_assistant(context: str) -> str:
     Returns:
         str: A comprehensive technical recommendation report.
     """
+    print(f"\033[91m[solution_planning_assistant] Input context: {context}\033[0m")
     model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
     try:
@@ -141,5 +125,5 @@ def semantic_search_expert_assistant(context: str) -> str:
 if __name__ == "__main__":
     # Test run
     sample_context = "I have 10 million documents, mostly English. Low latency is critical (<50ms). Budget is flexible. Preference for managed services."
-    result = semantic_search_expert_assistant(sample_context)
+    result = solution_planning_assistant(sample_context)
     print(result)

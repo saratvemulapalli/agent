@@ -1,90 +1,72 @@
-对比结果固化成**结构化中间产物**（shared state），下游只吃“结论 + 关键参数 + 可追溯依据”。
+# OpenSearch Solution Architect Agent 设计文档
 
-**不要传递全部上下文，传递“可验证的决策记录”。**
+## 1. 系统概述
 
----
+本系统是一个基于 LLM 的智能代理，旨在作为 OpenSearch 解决方案架构师，引导用户完成从初始需求分析到最终语义搜索方案落地的全过程。它通过多智能体协作（Multi-Agent Collaboration），结合内部知识库，提供专业的 OpenSearch 语义搜索技术建议和实施方案。
 
-## 推荐架构：Orchestrator + 2 个 Specialist（最稳）
+## 2. 系统架构
 
-### A. Orchestrator（编排/控上下文/控工具）
+系统由一个主协调器（Orchestrator）和三个专用子代理（Sub-Agents/Tools）组成。
 
-职责：
+### 2.1 核心组件
 
-1. 解析用户需求 → 形成标准化需求状态
-2. 调用“选型 agent”产出决策 JSON
-3. 根据决策 JSON 再调用“API agent”去文档检索并生成 request body
-4. 做最后一致性检查（字段是否齐全、与选型参数是否一致）
+#### 1. Orchestrator (协调器) - `orchestrator.py`
+- **角色**: 用户交互的主入口和流程控制中心。
+- **职责**:
+  - 管理对话状态和上下文。
+  - 引导用户提供关键需求信息（文档量、语言、预算、延迟要求、部署偏好等）。
+  - 根据对话阶段调用相应的子代理。
+  - 最终确认方案并触发执行。
+- **模型**: `us.anthropic.claude-sonnet-4-5-20250929-v1:0` (启用 Thinking 模式)。
 
-**Orchestrator 自己尽量不吃大段文档，只吃两个 agent 的结构化输出。**
+#### 2. Solution Planning Assistant (方案规划助手) - `solution_planning_assistant.py`
+- **角色**: 资深搜索架构专家。
+- **职责**:
+  - 接收用户需求上下文。
+  - 查阅内部知识库 (`read_knowledge_base`)。
+  - 生成详细的技术推荐方案，包括检索策略（BM25/向量/混合）、索引变体（HNSW/IVF等）和模型部署选项。
+  - 输出结构化的 `<conclusion>` 供协调器解析。
 
----
+#### 3. OpenSearch QA Assistant (问答助手) - `opensearch_qa_assistant.py`
+- **角色**: OpenSearch 语义搜索技术顾问。
+- **职责**:
+  - 在方案迭代阶段，回答用户关于具体技术细节、权衡或概念的疑问。
+  - 基于知识库提供准确、简洁的解答。
+  - 帮助用户理解方案并进行微调。
 
-### B. Solution/Design Agent（只看 private knowledge）
+#### 4. Worker Agent (执行代理) - `worker.py`
+- **角色**: 自动化实施工程师。
+- **职责**:
+  - 接收最终确认的技术方案。
+  - (目前为占位符) 模拟执行索引创建、模型配置等操作。
 
-职责：**选 index 算法 + 给出可落地参数**
-输入：用户需求、约束（延迟/成本/召回/更新频率/数据规模/多模态/过滤需求等）
-检索源：private knowledge（算法优劣、经验规则、历史案例）
-输出：一个“决策记录”（JSON）+ 简短解释
+### 2.2 辅助工具
+- **Knowledge Base Tools** (`scripts.tools`): 提供 `read_knowledge_base` 工具，使代理能够访问 OpenSearch 语义搜索的最佳实践和技术文档。
 
-关键点：它不负责 API 字段名，不负责 body 拼装，避免被文档细节污染注意力。
+## 3. 工作流程 (Workflow)
 
----
+系统遵循以下四个主要阶段：
 
-### C. API Composer Agent（只看 private documentation）
+1.  **需求澄清 (Clarify Requirements)**
+    - 协调器主动询问用户关键指标：数据规模、语言、预算/成本偏好、延迟要求 (P99)、精度-延迟权衡、模型部署方式等。
 
-职责：**把决策记录变成合法的 index request body**
-输入：Design Agent 的 JSON 决策记录 + 用户环境信息（region、project、权限等）
-检索源：private documentation（endpoint、schema、必填字段、枚举值、示例）
-输出：API request（endpoint + body + 说明）
-可选：做 schema 校验（如果你能拿到 OpenAPI/JSON Schema，强烈建议自动校验）
+2.  **方案提案 (Proposal)**
+    - 一旦收集到足够信息，协调器调用 `solution_planning_assistant`。
+    - 规划助手分析需求，生成初始技术推荐方案。
+    - 协调器向用户展示方案。
 
----
+3.  **方案迭代与精炼 (Refinement)**
+    - 用户对方案提出疑问或修改意见。
+    - 协调器调用 `opensearch_qa_assistant` 解答疑问，或重新调用规划助手调整方案。
+    - 此过程循环进行，直到用户明确确认满意 ("Yes, let's do it")。
 
-## “上下文传递”的核心：共享状态（Shared State）长这样
+4.  **执行 (Execution)**
+    - 用户确认后，协调器调用 `worker_agent`。
+    - 执行代理根据最终方案完成系统配置（模拟）。
+    - 向用户报告完成状态。
 
-你需要一个外部 state（数据库/kv/内存都行），每一步只把**必要字段**塞回模型上下文。
-
-示例（你可以按你们业务调整）：
-
-```json
-{
-  "user_requirements": {
-    "data_type": "text|image|hybrid",
-    "scale": {"docs": 20000000, "avg_tokens": 800},
-    "qps": 150,
-    "latency_p95_ms": 200,
-    "freshness": "near-real-time",
-    "filters": ["tenant_id", "lang", "date_range"],
-    "budget": "medium",
-    "constraints": ["must_support_multi_tenant", "compliance:pii"]
-  },
-  "candidate_algorithms": [
-    {"name": "HNSW", "pros": ["high_recall"], "cons": ["memory_heavy"]},
-    {"name": "IVF_PQ", "pros": ["cheap_memory"], "cons": ["recall_tradeoff"]}
-  ],
-  "decision": {
-    "selected": "HNSW",
-    "rationale": [
-      "P95 200ms + 高召回优先",
-      "近实时更新更友好"
-    ],
-    "index_params": {
-      "metric": "cosine",
-      "dim": 768,
-      "hnsw": {"M": 32, "ef_construction": 200, "ef_search": 64},
-      "sharding": {"num_shards": 12}
-    },
-    "expected_tradeoffs": {
-      "memory": "high",
-      "build_time": "medium",
-      "recall": "high"
-    }
-  },
-  "api_plan": {
-    "endpoint_hint": "CreateIndex",
-    "doc_version": "vX.Y"
-  }
-}
-```
-
-**Design Agent 只负责把 `decision` 填好**；API Agent 只负责把 `decision.index_params` 映射到真实 schema 字段。
+## 4. 技术细节
+- **框架**: `strands` (Agent Framework)
+- **模型服务**: AWS Bedrock
+- **核心模型**: Claude 3.5 Sonnet (v2) with Thinking Blocks
+- **记忆机制**: 通过 Orchestrator 维护对话历史和状态。
