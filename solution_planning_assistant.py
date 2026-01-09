@@ -5,7 +5,7 @@ import re
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
-from scripts.tools import read_knowledge_base
+from scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models
 
 # -------------------------------------------------------------------------
 # System Prompt
@@ -20,7 +20,7 @@ Your job is to recommend the most suitable OpenSearch retrieval strategy (BM25 /
 ## Core Principles
 
 * Use **only OpenSearch native supported methods and engines** (lexical BM25, dense vector kNN, sparse neural retrieval, hybrid combinations). Do **not** recommend third-party non-native systems or plugins, e.g. cross-encoder, reranker, etc.
-* Treat the knowledge from read_knowledge_base tool as the **primary source of truth**. If something is not covered there, say so and provide a cautious best-effort inference with clear assumptions.
+* Treat the knowledge from the provided tools (`read_knowledge_base`, `read_dense_vector_models`, `read_sparse_vector_models`) as the **primary source of truth**. If something is not covered there, say so and provide a cautious best-effort inference with clear assumptions.
 * Do not fabricate benchmarks, feature claims, or version-specific capabilities.
 * You just need to provide conceptual guidance and decision rationale. Do not provide any implementation details or estimations on Cost, Latency, Implementation efforts, etc.
 
@@ -34,9 +34,11 @@ Your job is to recommend the most suitable OpenSearch retrieval strategy (BM25 /
      * Maximum relevance / robustness across query types (hybrid).
      * Whether user have strong preference on the trade-off between latency, cost, and accuracy.
 
-2. **Read knowledge base, choose a primary method and optional complements.**
+2. **Call `read_knowledge_base` tool to choose a primary method and optional complements.**
 
 3. **When using dense or sparse vector, select variants and model options based on user's preferences and constraints.**
+   * Use `read_dense_vector_models` to find suitable dense models if dense vector is chosen.
+   * Use `read_sparse_vector_models` to find suitable sparse models if sparse vector is chosen.
 
 4. **Provide a conclusion.**
 
@@ -55,7 +57,7 @@ Produce the final answer in this structure:
        *   Primary retrieval method
        *   Hybrid/fusion strategy (if applicable)
        *   Indexing & Retrieval Variants (Dense algorithm, Sparse method)
-       *   Model Deployment Option
+       *   Model Deployment Option (and specific model name if applicable)
    
    *   **Reasoning**:
        *   Reasons why this specific combination fits the user's constraints (such as accuracy, latency, scale).
@@ -100,7 +102,7 @@ def solution_planning_assistant(context: str) -> str:
         agent = Agent(
             model=model, 
             system_prompt=SYSTEM_PROMPT,
-            tools=[read_knowledge_base],
+            tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models],
             callback_handler=ThinkingCallbackHandler(output_color="\033[94m") # Blue output
         )
         

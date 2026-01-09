@@ -38,7 +38,7 @@ Your goal is to guide the user from initial requirements to a finalized, execute
     *   **Budget/Cost**: Is there a strict budget? Is cost-effective search required?
     *   **Latency Requirements**: What is the target P99 latency?
     *   **Latency-Accuracy Trade-off**: What is the desired trade-off between latency and accuracy?
-    *   **Model Deployment**: SageMaker GPU endpoint, embedding API service, ML node deployment, custom model deployment, etc.?
+    *   **Model Deployment**: SageMaker GPU endpoint, embedding API service, OpenSearch Node deployment, custom model deployment, etc.?
     *   **Special Requirements**: Any special requirements? (e.g., prefix queries, wildcard support, etc.)
     
     Only prompt the user **once** for these details. 

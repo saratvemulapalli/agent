@@ -275,50 +275,14 @@ Scales with doc size O(log n)
 
 ### 2.7 Model Deployment Options
 
-#### 2.7.1 External API Services
+#### 2.7.1 Supported Modes
+Dense vector search in OpenSearch supports three main deployment modes for embedding models:
 
-Examples of major providers: OpenAI, Cohere, Amazon Bedrock, Azure OpenAI, Google Vertex AI.
-Typical latency between 30-200ms and costs generally in the $0.02–$0.13 per 1M tokens range.
+1.  **API Services**: (e.g., Amazon Bedrock, OpenAI) - Best for ease of use and access to SOTA models.
+2.  **OpenSearch Node (CPU)**: Best for self-contained deployments and moderate latency/throughput.
+3.  **SageMaker GPU Endpoint**: Best for high-performance, low-latency production workloads with custom or open-source models.
 
-**Pros:**
-- No infrastructure management
-- Access to state-of-the-art models
-- Pay-per-use pricing
 
-**Cons:**
-- Network latency added to every request
-- Cost can be high at scale
-- Data leaves your network
-- Rate limits may apply
-
-#### 2.7.2 OpenSearch ML Node Deployment
-
-**Overview:** Deploy models directly on OpenSearch ML nodes using CPU inference.
-
-**Supported Model Types:**
-- OpenSearch pre-trained models
-- Custom models not supported
-
-**Latency Characteristics:**
-
-| Model Size | Latency (single) | Throughput |
-|------------|------------------|------------|
-| MiniLM (22M) | 5-15ms | 100-200 req/s per node |
-| MPNet (110M) | 20-50ms | 30-60 req/s per node |
-| Large (335M) | 50-150ms | 10-25 req/s per node |
-
-**Pros:**
-- No external dependencies
-- Data stays within cluster
-- Predictable costs
-- Lower latency than external APIs
-
-**Cons:**
-- Must manage model lifecycle
-- Limited to models that fit in memory
-- CPU inference slower than GPU
-- Scaling requires cluster changes
-- Race for resources with search workloads
 
 ### 2.8 Total Latency Composition
 
@@ -456,9 +420,12 @@ In this mode, both documents and queries are processed by the same deep neural n
 
 ### 3.7 Model Deployment Options
 
-Sparse vector models have similar deployment options to dense vector models: ML node deployment, SageMaker GPU endpoint deployment.
+Sparse vector search (Neural Sparse) supports the following deployment modes:
 
-For most use case, ML node is only recommended for sparse tokenizer deployment. And sparse encoding model should be deployed on SageMaker GPU endpoint. The only exception is cost. i.e. user don't want to spend money on a SageMaker GPU instance.
+1.  **OpenSearch Node (CPU)**: Generally only recommended for the **Tokenizer** in Doc-Only mode.
+2.  **SageMaker GPU Endpoint**: Strongly recommended for Ingestion (Encoding) and Search (Bi-encoder mode).
+
+For most use case, OpenSearch Node is only recommended for sparse tokenizer deployment. And sparse encoding model should be deployed on SageMaker GPU endpoint. The only exception is cost. i.e. user don't want to spend money on a SageMaker GPU instance.
 
 ### 3.8 When to Use Sparse Vector
 

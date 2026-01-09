@@ -5,7 +5,7 @@ import re
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
-from scripts.tools import read_knowledge_base
+from scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models
 
 # -------------------------------------------------------------------------
 # System Prompt
@@ -20,7 +20,7 @@ Your goal is to answer questions related to OpenSearch semantic search.
 ## Responsibilities
 
 1. **Understand the Question**
-2. **Consult the Knowledge Base**: Use `read_knowledge_base` to check for specific details.
+2. **Consult the Knowledge Base**: Use `read_knowledge_base`, `read_dense_vector_models`, or `read_sparse_vector_models` to check for specific details based on the topic.
 3. **Provide the Answer**: Offer a brief answer based on the knowledge base.
 
 ## Output
@@ -64,7 +64,7 @@ def opensearch_qa_assistant(query: str) -> str:
         agent = Agent(
             model=model, 
             system_prompt=SYSTEM_PROMPT,
-            tools=[read_knowledge_base],
+            tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models],
             callback_handler=ThinkingCallbackHandler(output_color="\033[96m") # Cyan output for follow-up
         )
         
