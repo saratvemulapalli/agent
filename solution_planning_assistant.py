@@ -6,6 +6,7 @@ from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
 from scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models
+from worker import SAMPLE_CONTEXT
 
 # -------------------------------------------------------------------------
 # System Prompt
@@ -57,7 +58,12 @@ Produce the final answer in this structure:
        *   Primary retrieval method
        *   Hybrid/fusion strategy (if applicable)
        *   Indexing & Retrieval Variants (Dense algorithm, Sparse method)
-       *   Model Deployment Option (and specific model name if applicable)
+       *   Model Deployment Option
+       *   **Selected Model ID(s)**: 
+           *   For OpenSearch Node / ML Node: Provide the EXACT Model Name from the knowledge base (e.g., "huggingface/sentence-transformers/all-MiniLM-L6-v2").
+           *   For SageMaker GPU Endpoint: Provide the **Hugging Face Model ID** (e.g., "intfloat/e5-base-v2").
+           *   For External API Service: Provide the Provider and Model Name (e.g., "Amazon Bedrock - amazon.titan-embed-text-v2").
+
    
    *   **Reasoning**:
        *   Reasons why this specific combination fits the user's constraints (such as accuracy, latency, scale).
@@ -124,8 +130,23 @@ def solution_planning_assistant(context: str) -> str:
     except Exception as e:
         raise e
 
+
+SAMPLE_CONTEXT = """
+User Requirements:
+- Document count: 10 million documents
+- Language: English (monolingual)
+- Content type: Text documents (sample: "The quick brown fox jumps over the lazy dog. This is a sample document for testing search capabilities.")
+- Budget: No budget limitation
+- Priority: BEST SEARCH RELEVANCE (accuracy is the top priority)
+- Latency requirements: Not specified (reasonable latency acceptable given focus on accuracy)
+- Model deployment: Not specified (can use any deployment method)
+- Special requirements: None specified
+
+Key Focus: Maximum search accuracy and relevance for English text semantic search at 10M document scale.
+"""
+
 if __name__ == "__main__":
     # Test run
     sample_context = "I have 10 million documents, mostly English. Low latency is critical (<50ms). Budget is flexible. Preference for managed services."
-    result = solution_planning_assistant(sample_context)
+    result = solution_planning_assistant(SAMPLE_CONTEXT)
     print(result)

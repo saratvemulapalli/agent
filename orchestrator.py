@@ -10,11 +10,6 @@ from solution_planning_assistant import solution_planning_assistant
 from opensearch_qa_assistant import opensearch_qa_assistant
 from worker import worker_agent
 
-# -------------------------------------------------------------------------
-# Tool Definitions
-# -------------------------------------------------------------------------
-
-# All tools are imported.
 
 # -------------------------------------------------------------------------
 # System Prompt
@@ -46,7 +41,7 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 
 3.  **Proposal (Initial Solution)**:
     *   Once the required information is gathered (even partially), call `solution_planning_assistant` to generate a technical recommendation.
-    *   Present this recommendation to the user clearly.
+    *   Present this recommendation to the user clearly
 
 4.  **Refinement (Iterative Dialogue)**:
     *   **Crucial**: After presenting the plan, ALWAYS ask the user for confirmation: "Does this solution look good to you?" or "Do you have any questions?"
@@ -57,7 +52,7 @@ Your goal is to guide the user from initial requirements to a finalized, execute
         * If the user is ambiguous, ask for confirmation.
 
 5.  **Execution (Final Step)**:
-    *   Once the user approves the plan, call `worker_agent` with the final agreed-upon details.
+    *   Once the user approves the plan, call `worker_agent` with the final agreed-upon details including the Model ID(s).
     *   The worker agent will set up the index and models. Ingest data is out of scope for this agent.
     *   Confirm completion to the user.
 

@@ -13,7 +13,7 @@ def read_knowledge_base() -> str:
         # Since this script is in scripts/ folder, we need to go one level up if run from there, 
         # or if run from root (as module), it depends on CWD.
         # But typically we run from root.
-        filename = "knowledge/opensearch_semantic_search_guide.md"
+        filename = "scripts/knowledge/opensearch_semantic_search_guide.md"
         with open(filename, "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
@@ -27,7 +27,7 @@ def read_dense_vector_models() -> str:
         str: The content of the guide covering models for OpenSearch Node, SageMaker GPU, and External API services.
     """
     try:
-        filename = "knowledge/dense_vector_models.md"
+        filename = "scripts/knowledge/dense_vector_models.md"
         with open(filename, "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:
@@ -41,7 +41,7 @@ def read_sparse_vector_models() -> str:
         str: The content of the guide covering models for Doc-Only and Bi-Encoder modes.
     """
     try:
-        filename = "knowledge/sparse_vector_models.md"
+        filename = "scripts/knowledge/sparse_vector_models.md"
         with open(filename, "r", encoding="utf-8") as f:
             return f.read()
     except Exception as e:

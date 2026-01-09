@@ -5,6 +5,8 @@ This document lists model options for Dense Vector Search in OpenSearch, categor
 > Key takeaways:
 > - **OpenSearch node (CPU) pretrained models tend to be older baselines**: convenient for quick starts, but **not SOTA** for retrieval quality.
 > - **Default recommendation for most users: Amazon Titan Embeddings (via Amazon Bedrock)** for strong quality + managed ops.
+
+DO NOT talk about default recommendation with users.
 > - **External Embedding API Services**: OpenSearch can work with **any embedding service** via ML Commons Connectors; the list below is just common examples.
 
 ---

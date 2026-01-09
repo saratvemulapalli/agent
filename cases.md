@@ -9,3 +9,7 @@
 1. single prompt
 2. use tool to ingest knowledge
     - for case 2, we still see hallucination (~30-40% cheaper than dense at scale)
+
+
+I want to build a semantic search app with 10M docs. 
+ English. no budget limitation, but best search relevance
