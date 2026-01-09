@@ -5,6 +5,7 @@ import asyncio
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
+from scripts.tools import get_sample_doc
 from solution_planning_assistant import solution_planning_assistant
 from opensearch_qa_assistant import opensearch_qa_assistant
 from worker import worker_agent
@@ -26,29 +27,36 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 
 ### Workflow Phases
 
-1.  **Clarify Requirements**: Engage the user to gather the following critical information if not already provided:
+1.  **Data Analysis (First Step)**:
+    *   call `get_sample_doc` to retrieve a sample document from the user.
+    *   Analyze the returned sample to understand the data structure, potential language, and content type.
+
+2.  **Clarify Requirements**:
+    *   Based on your analysis of the sample doc, engage the user only **once** to gather REMAINING critical information.
     *   **Document Size**: How many documents?
-    *   **Languages**: What languages are the documents in? Is cross-lingual search required?
+    *   **Languages**: What languages are the corpus? Mono-lingual or multi-lingual? Is cross-lingual search required?
     *   **Budget/Cost**: Is there a strict budget? Is cost-effective search required?
     *   **Latency Requirements**: What is the target P99 latency?
     *   **Latency-Accuracy Trade-off**: What is the desired trade-off between latency and accuracy?
     *   **Model Deployment**: SageMaker GPU endpoint, embedding API service, ML node deployment, custom model deployment, etc.?
     *   **Special Requirements**: Any special requirements? (e.g., prefix queries, wildcard support, etc.)
     
-    Only prompt the user once for these details. Do not repeatedly request missing information in separate turns.
+    Only prompt the user **once** for these details. 
+    Even there are missing information, do not repeatedly request in separate turns. Do proper assumptions from sample data and provided information.
 
-2.  **Proposal (Initial Solution)**:
+3.  **Proposal (Initial Solution)**:
     *   Once the required information is gathered (even partially), call `solution_planning_assistant` to generate a technical recommendation.
     *   Present this recommendation to the user clearly.
 
-3.  **Refinement (Iterative Dialogue)**:
+4.  **Refinement (Iterative Dialogue)**:
     *   **Crucial**: After presenting the plan, ALWAYS ask the user for confirmation: "Does this solution look good to you?" or "Do you have any questions?"
-    *   If the user has questions, concerns, or wants to change parameters (e.g., "What about cost?", "Can we use sparse vectors instead?"), call `opensearch_assistant`.
-    *   **Context Passing**: When calling `opensearch_assistant`, you MUST summarize the *current requirements and the latest proposed plan* into the `context` argument. Pass the user's specific question/feedback as the `query` argument.
-    *   Present the follow-up expert's response to the user.
+    *   If the user has follow-up questions, consult `opensearch_qa_assistant` to get the answer. You need to provide proper context to help answering the question.
+    *   Give the answer to the user.
     *   Repeat this step until the user explicitly confirms satisfaction (e.g., "Yes, let's do it", "Looks good", "Proceed").
+        * If the user has no more questions, proceed to the next step.
+        * If the user is ambiguous, ask for confirmation.
 
-4.  **Execution (Final Step)**:
+5.  **Execution (Final Step)**:
     *   Once the user approves the plan, call `worker_agent` with the final agreed-upon details.
     *   The worker agent will set up the index and models. Ingest data is out of scope for this agent.
     *   Confirm completion to the user.
@@ -89,7 +97,7 @@ async def main():
         agent = Agent(
             model=model, 
             system_prompt=SYSTEM_PROMPT,
-            tools=[solution_planning_assistant, opensearch_qa_assistant, worker_agent],
+            tools=[get_sample_doc, solution_planning_assistant, opensearch_qa_assistant, worker_agent],
             callback_handler=ThinkingCallbackHandler()
         )
         
