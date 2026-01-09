@@ -459,7 +459,7 @@ When maximum relevance is the primary goal, Hybrid Search is the recommended app
 
 - **Recommended Combinations**:
   - **Dense + Sparse**: Have best search relevance. Provides two layers of semantic understanding (dense for context, sparse for learned expansion).
-  - **Dense + BM25**: Combines semantic understanding with exact keyword precision.
+  - **Dense + BM25**: A robust baseline to combine semantic understanding with exact keyword precision.
   
 - **Not Recommended**:
   - **Sparse + BM25**: Generally redundant. Sparse vectors already capture keyword information (lexical match) along with expansion, making the addition of BM25 less impactful for the cost.

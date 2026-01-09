@@ -32,6 +32,25 @@ Provide a brief response answering the question. And explain the reasoning behin
 * Do not mention the knowledge base in your answer.
 """
 
+model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+model = BedrockModel(
+    model_id=model_id,
+    max_tokens=8000,
+    additional_request_fields={
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": 2048,
+        }
+    }
+)
+
+agent = Agent(
+    model=model, 
+    system_prompt=SYSTEM_PROMPT,
+    tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models],
+    callback_handler=ThinkingCallbackHandler(output_color="\033[96m") # Cyan output for follow-up
+)
+
 # -------------------------------------------------------------------------
 # Tool Execution
 # -------------------------------------------------------------------------
@@ -47,38 +66,14 @@ def opensearch_qa_assistant(query: str) -> str:
         str: The answer to the question.
     """
     print(f"\033[91m[opensearch_qa_assistant] Input query: {query}\033[0m")
-    model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-
-    try:
-        model = BedrockModel(
-            model_id=model_id,
-            max_tokens=8000,
-            additional_request_fields={
-                "thinking": {
-                    "type": "enabled",
-                    "budget_tokens": 2048,
-                }
-            }
-        )
         
-        agent = Agent(
-            model=model, 
-            system_prompt=SYSTEM_PROMPT,
-            tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models],
-            callback_handler=ThinkingCallbackHandler(output_color="\033[96m") # Cyan output for follow-up
-        )
-        
-        user_message = f"User Question: {query}"
-        
-        response = agent(user_message)
-        return str(response)
-
-    except Exception as e:
-        return f"Error in opensearch qa assistant: {e}"
+    response = agent(query)
+    return str(response)
 
 if __name__ == "__main__":
     # Test run
     sample_query = "For dense vector search, what are the best models to use?"
+    result = opensearch_qa_assistant(sample_query)
     sample_query = "How does doc-only mode work in sparse neural search? Explain the mechanism and why it's faster and cheaper than bi-encoder mode."
     result = opensearch_qa_assistant(sample_query)
     print(result)

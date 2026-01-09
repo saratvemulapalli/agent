@@ -13,3 +13,4 @@
 
 I want to build a semantic search app with 10M docs. 
  English. no budget limitation, but best search relevance
+ I don't want to buy a GPU endpoint. give me a new plan
