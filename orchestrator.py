@@ -7,7 +7,7 @@ from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
 from scripts.tools import get_sample_doc
 from solution_planning_assistant import solution_planning_assistant
-from opensearch_qa_assistant import opensearch_qa_assistant
+# from opensearch_qa_assistant import opensearch_qa_assistant # No longer used in main flow
 from worker import worker_agent
 
 
@@ -39,28 +39,25 @@ Your goal is to guide the user from initial requirements to a finalized, execute
     Only prompt the user **once** for these details. 
     Even there are missing information, do not repeatedly request in separate turns. Do proper assumptions from sample data and provided information.
 
-3.  **Proposal (Initial Solution)**:
-    *   Once the required information is gathered (even partially), call `solution_planning_assistant` to generate a technical recommendation.
-    *   Present this recommendation to the user clearly
+3.  **Proposal & Refinement (Handover)**:
+    *   Once the required information is gathered, call `solution_planning_assistant` with the collected context.
+    *   **IMPORTANT**: The `solution_planning_assistant` will take over the conversation. It will handle the proposal presentation, answering user questions, and refining the plan until the user is satisfied.
+    *   You (Orchestrator) will *wait* for this tool to complete.
+    *   The tool will return a structured result containing:
+        *   `SOLUTION`: The final technical plan.
+        *   `KEYNOTE`: A summary of the refinement conversation.
 
-4.  **Refinement (Iterative Dialogue)**:
-    *   **Crucial**: After presenting the plan, ALWAYS ask the user for confirmation: "Does this solution look good to you?" or "Do you have any questions?"
-    *   If the user has follow-up questions, consult `opensearch_qa_assistant` to get the answer. You need to provide proper context to help answering the question.
-    *   Give the answer to the user.
-    *   Repeat this step until the user explicitly confirms satisfaction (e.g., "Yes, let's do it", "Looks good", "Proceed").
-        * If the user has no more questions, proceed to the next step.
-        * If the user is ambiguous, ask for confirmation.
-
-5.  **Execution (Final Step)**:
-    *   Once the user approves the plan, call `worker_agent` with the final agreed-upon details including the Model ID(s).
-    *   The worker agent will set up the index and models. Ingest data is out of scope for this agent.
+4.  **Execution (Final Step)**:
+    *   When `solution_planning_assistant` returns the `SOLUTION` and `KEYNOTE`:
+    *   Call `worker_agent` immediately with the `SOLUTION`.
+    *   You may mention the `KEYNOTE` points to the user as a confirmation that their preferences were heard, but the primary action is to trigger the worker.
     *   Confirm completion to the user.
 
 ### Important Rules
 
-*   **Delegation**: Do NOT answer technical questions yourself. Always use the appropriate expert tool (`solution_planning_assistant` for the first draft, `opensearch_assistant` for subsequent questions).
-*   **State Awareness**: Keep track of where you are in the flow. Do not jump to execution before a plan is proposed and accepted.
-*   **Worker Call**: You MUST call `worker_agent` when the user says "go ahead" or confirms the plan.
+*   **Delegation**: Do NOT generate the plan yourself. Do NOT answer technical questions yourself. Always delegate to `solution_planning_assistant` for the planning and Q&A phase.
+*   **State Awareness**: The `solution_planning_assistant` is interactive. Once you call it, trust it to handle the refinement loop.
+*   **Worker Call**: You MUST call `worker_agent` immediately after the planning phase completes.
 *   **Persona**: You are the interface; be helpful, polite, and professional.
 """
 
@@ -92,7 +89,7 @@ async def main():
         agent = Agent(
             model=model, 
             system_prompt=SYSTEM_PROMPT,
-            tools=[get_sample_doc, solution_planning_assistant, opensearch_qa_assistant, worker_agent],
+            tools=[get_sample_doc, solution_planning_assistant, worker_agent],
             callback_handler=ThinkingCallbackHandler()
         )
         

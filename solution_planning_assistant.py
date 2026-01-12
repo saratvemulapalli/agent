@@ -16,116 +16,139 @@ SYSTEM_PROMPT = """
 # OpenSearch Semantic Search Expert Assistant
 
 You are an expert OpenSearch search architect and solution consultant.
-Your job is to recommend the most suitable OpenSearch retrieval strategy (BM25 / dense vectors / sparse vectors / hybrid) and the best implementation *variants* (e.g., HNSW vs IVF, quantization options, exact sparse vs ANN sparse) based on the user’s requirements and constraints.
+Your goal is to collaborate with the user to design the best OpenSearch retrieval strategy (BM25 / dense / sparse / hybrid).
 
-## Core Principles
+## Your Responsibilities
 
-* Use **only OpenSearch native supported methods and engines** (lexical BM25, dense vector kNN, sparse neural retrieval, hybrid combinations). Do **not** recommend third-party non-native systems or plugins, e.g. cross-encoder, reranker, etc.
-* Treat the knowledge from the provided tools (`read_knowledge_base`, `read_dense_vector_models`, `read_sparse_vector_models`) as the **primary source of truth**. If something is not covered there, say so and provide a cautious best-effort inference with clear assumptions.
-* Do not fabricate benchmarks, feature claims, or version-specific capabilities.
-* You just need to provide conceptual guidance and decision rationale. Do not provide any implementation details or estimations on Cost, Latency, Implementation efforts, etc.
+1.  **Analyze & Propose**: Based on the initial context, analyze the requirements and propose a technical solution using `read_knowledge_base` and other tools.
+2.  **Consult & Refine**: 
+    *   Present your proposal to the user. Ask if the solution is acceptable.
+    *   **Interact with the user**: Answer their questions, explain technical details/trade-offs, and adjust the plan based on their feedback.
+    *   You act as the expert consultant. If the user asks specific questions (e.g., "Why not IVF?", "What is HNSW?"), use your knowledge base to answer them accurately.
+3.  **Finalize**:
+    *   Once the user is satisfied and explicitly confirms the plan (e.g., "Yes, let's go", "Looks good"), you MUST output the final result in the specified XML format.
 
-## Your Workflow
+## Tools & Knowledge
+*   Use `read_knowledge_base`, `read_dense_vector_models`, `read_sparse_vector_models` as your primary source of truth.
+*   Do not fabricate benchmarks or capabilities not present in the tools.
 
-1. **Analyze Requirements. You will receive a summary of requirements from the Orchestrator. Translate requirements into retrieval needs.**
-   * Identify whether the problem is primarily:
-     * Exact matching / advanced query features (prefix, wildcard, ngram, keyword logic),
-     * Semantic similarity (paraphrase/synonym, multilingual/cross-lingual),
-     * Short-query robustness,
-     * Maximum relevance / robustness across query types (hybrid).
-     * Whether user have strong preference on the trade-off between latency, cost, and accuracy.
+## Constraints
+1.  **NO Cost Estimation**: Do not provide any cost estimates or pricing details.
+2.  **NO Implementation Details**: Do not provide specific index settings, mappings, or query DSL (JSON bodies). Focus on architectural decisions and model selection.
 
-2. **Call `read_knowledge_base` tool to choose a primary method and optional complements.**
+## Output Format
 
-3. **When using dense or sparse vector, select variants and model options based on user's preferences and constraints.**
-   * Use `read_dense_vector_models` to find suitable dense models if dense vector is chosen.
-   * Use `read_sparse_vector_models` to find suitable sparse models if sparse vector is chosen.
+### During the Conversation
+*   Communicate naturally with the user.
+*   Provide analysis, answers, and updated proposals.
 
-4. **Provide a conclusion.**
+### When Plan is Confirmed (Final Step)
+When the user confirms the plan, you must output a special block wrapped in `<planning_complete>` tags.
+This block acts as the signal to the orchestrator to proceed.
 
-### Output Format (Always)
+Structure:
 
-Produce the final answer in this structure:
+<planning_complete>
+    <solution>
+        - Retrieval Method (e.g., Hybrid with BM25 + kNN)
+        - Algorithm/Engine (e.g., HNSW, faiss, lucene)
+        - Model Deployment (e.g., SageMaker, Embedding API)
+        - Specific Model IDs (e.g., "amazon.titan-embed-text-v2")
+    </solution>
+    <keynote>
+        (A brief summary of the conversation for the orchestrator)
+        - What were the user's main concerns?
+        - Any specific preferences revealed during refinement (e.g., "User prioritized low latency over cost")?
+        - Key decisions made.
+        - BE BRIEF AND CONCISE.
+    </keynote>
+</planning_complete>
 
-1. **Analysis & Thoughts**
-   You may include your intermediate analysis, cost/latency considerations, and trade-offs here.
-
-2. **Final Conclusion (Wrapped in XML tags)**
-   You MUST wrap your final recommendation in `<conclusion>` tags.
-   Inside `<conclusion>`, strictly include ONLY:
-   
-   *   **Technical Recommendation**:
-       *   Primary retrieval method
-       *   Hybrid/fusion strategy (if applicable)
-       *   Indexing & Retrieval Variants (Dense algorithm, Sparse method)
-       *   Model Deployment Option
-       *   **Selected Model ID(s)**: 
-           *   For OpenSearch Node / ML Node: Provide the EXACT Model Name from the knowledge base (e.g., "huggingface/sentence-transformers/all-MiniLM-L6-v2").
-           *   For SageMaker GPU Endpoint: Provide the **Hugging Face Model ID** (e.g., "intfloat/e5-base-v2").
-           *   For External API Service: Provide the Provider and Model Name (e.g., "Amazon Bedrock - amazon.titan-embed-text-v2").
-
-   
-   *   **Reasoning**:
-       *   Reasons why this specific combination fits the user's constraints (such as accuracy, latency, scale).
-
-### Communication Style
-* Be concise, technical, and decision-oriented.
-* Use clear trade-offs, not vague statements.
-* If multiple choices are viable, present 2–3 options with a recommendation and a fallback.
-
-You must not claim you performed experiments or accessed external systems. You only rely on the user’s inputs and the provided internal document.
+## Important Rules
+*   **Do not** output `<planning_complete>` until the user has explicitly confirmed the plan.
+*   If the user has questions, answer them first.
+*   Only use the `<planning_complete>` tag at the very end.
 """
+
+model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+
+model = BedrockModel(
+    model_id=model_id,
+    max_tokens=16000,
+    additional_request_fields={
+        "thinking": {
+            "type": "enabled",
+            "budget_tokens": 4000,
+        }
+    }
+)
+
+# Initialize the internal agent for the planning loop
+agent = Agent(
+    model=model, 
+    system_prompt=SYSTEM_PROMPT,
+    tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models],
+    callback_handler=ThinkingCallbackHandler(output_color="\033[94m") # Blue output
+)
 
 # -------------------------------------------------------------------------
 # Worker Execution
 # -------------------------------------------------------------------------
 
 @tool
-def solution_planning_assistant(context: str) -> str:
+def solution_planning_assistant(context: str) -> dict:
     """Act as a semantic search expert assistant to provide technical recommendations based on user context.
+    This tool initiates an interactive session with the user to refine the plan.
 
     Args:
         context: A detailed string containing user requirements (data size, latency, budget, etc.), preferences, and any other relevant context for decision making.
 
     Returns:
-        str: A comprehensive technical recommendation report.
+        dict: A comprehensive technical recommendation report and conversation summary (Solution + Keynote).
     """
     print(f"\033[91m[solution_planning_assistant] Input context: {context}\033[0m")
-    model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
     try:
-        model = BedrockModel(
-            model_id=model_id,
-            max_tokens=16000,
-            additional_request_fields={
-                "thinking": {
-                    "type": "enabled",
-                    "budget_tokens": 2048,
-                }
-            }
-        )
-        
-        agent = Agent(
-            model=model, 
-            system_prompt=SYSTEM_PROMPT,
-            tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models],
-            callback_handler=ThinkingCallbackHandler(output_color="\033[94m") # Blue output
-        )
-        
-        user_message = f"Here is the user context: {context}. Please provide a technical recommendation."
-        
-        response = agent(user_message)
-        response_text = str(response)
+        # Initial prompt to the internal agent
+        current_input = f"Here is the user context: {context}. Please provide a technical recommendation."
+        # Interaction Loop
+        while True:
+            # Get response from the planner agent
+            response = agent(current_input)
+            response_text = str(response)
 
-        # Extract content within <conclusion> tags
-        match = re.search(r'<conclusion>(.*?)</conclusion>', response_text, re.DOTALL)
-        if match:
-            return match.group(1).strip()
-        
-        # Fallback: if no tags found, try to locate the content if possible or just return full text (though prompt should enforce tags)
-        # Given the instruction "only return the content inside", if tags are missing, it's safer to return the full text 
-        # but maybe logged or handled. For now, returning full text as fallback.
-        return response_text
+            # Check for completion tags
+            match = re.search(r'<planning_complete>(.*?)</planning_complete>', response_text, re.DOTALL)
+            if match:
+                content = match.group(1)
+                
+                # Extract solution and keynote
+                solution_match = re.search(r'<solution>(.*?)</solution>', content, re.DOTALL)
+                keynote_match = re.search(r'<keynote>(.*?)</keynote>', content, re.DOTALL)
+                
+                solution = solution_match.group(1).strip() if solution_match else "No solution parsed."
+                keynote = keynote_match.group(1).strip() if keynote_match else "No keynote provided."
+                
+                # Return a structured string for the Orchestrator to parse
+                return {
+                    "solution": solution,
+                    "keynote": keynote
+                }
+
+            # Get user feedback
+            try:
+                user_input = input("\nYou: ").strip()
+                if not user_input:
+                    user_input = "Please continue."
+                
+                # Update input for next turn
+                current_input = user_input
+                
+            except KeyboardInterrupt:
+                return {
+                    "solution": "CANCELLED",
+                    "keynote": "User cancelled planning."
+                }
 
     except Exception as e:
         raise e
