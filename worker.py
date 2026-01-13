@@ -1,7 +1,7 @@
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
-from scripts.opensearch_ops_tools import create_index
+from scripts.opensearch_ops_tools import create_index, create_and_attach_pipeline, create_bedrock_embedding_model, create_local_pretrained_model, index_doc, delete_doc
 from scripts.tools import retrieve_from_documentation
 
 # -------------------------------------------------------------------------
@@ -16,13 +16,17 @@ Your goal is to execute the technical plan provided in the context.
 
 ## Your Responsibilities
 1.  **Analyze the Plan**: specific index settings, mappings, and configurations.
-2.  **Execute**: Use the `create_index` tool to create the indices with the correct configurations.
-    *   Construct the index body (settings and mappings) based on the plan.
-    *   Call `create_index` with the appropriate index name and body.
-3.  **Report**: Confirm successful execution.
+2.  **Execute (in specific order)**:
+    *   **First**: Create necessary models (e.g., Bedrock embedding models, Local pretrained models).
+    *   **Second**: Create the index with the correct settings and mappings.
+    *   **Third**: Create the ingest pipeline and attach it to the index (this often requires models to be ready).
+    *   **Fourth (Verification)**: Index a sample document to verify the pipeline and index configuration work as expected.
+    *   **Fifth (Cleanup)**: Delete the sample document after successful verification.
+3.  **Report**: Confirm successful execution of all steps.
 
 ## Important Rules
 1. When using sparse vector search with SEISMIC or ANN, you should use `sparse_vector` field instead of `rank_features` field.
+2. Always verify your work by indexing a sample document.
 """
 
 # -------------------------------------------------------------------------
@@ -58,11 +62,11 @@ def worker_agent(context: str) -> str:
         agent = Agent(
             model=model,
             system_prompt=SYSTEM_PROMPT,
-            tools=[create_index, retrieve_from_documentation],
+            tools=[create_index, retrieve_from_documentation, create_and_attach_pipeline, create_bedrock_embedding_model, create_local_pretrained_model, index_doc, delete_doc],
             callback_handler=ThinkingCallbackHandler(output_color="\033[92m") # Green for worker
         )
         
-        instruction = f"Here is the approved plan:\n{context}\nPlease implement this plan by creating the necessary indices."
+        instruction = f"Here is the approved plan:\n{context}\nPlease implement this plan."
         
         response = agent(instruction)
         return str(response)
@@ -113,12 +117,12 @@ SAMPLE_CONTEXT_2 = """
 - Retrieval Method: Hybrid Search (Dense Vector + Sparse Vector)
         - Dense Vector Configuration:
           * Algorithm: HNSW (lucene or faiss engine)
-          * Model: amazon.titan-embed-text-v2 (1536 dimensions)
+          * Model: amazon.titan-embed-text-v2 (1024 dimensions)
           * Deployment: Amazon Bedrock API
         - Sparse Vector Configuration:
           * Mode: Doc-only
-          * Ingestion Model: amazon/neural-sparse/opensearch-neural-sparse-encoding-doc-v3-gte
-          * Ingestion Deployment: SageMaker GPU Endpoint (ml.g5.xlarge)
+          * Ingestion Model: amazon/neural-sparse/opensearch-neural-sparse-encoding-doc-v2-mini
+          * Ingestion Deployment: OpenSearch Node (CPU)
           * Query Tokenizer: amazon/neural-sparse/opensearch-neural-sparse-tokenizer-v1
           * Query Deployment: OpenSearch Node (CPU)
           * Index Backend: rank_features (exact search)
@@ -131,7 +135,7 @@ SAMPLE_CONTEXT_3 = """
         - **Dense Vector Configuration:**
           - Algorithm: HNSW (Hierarchical Navigable Small World)
           - Model Deployment: Amazon Bedrock Embedding API
-          - Model: amazon.titan-embed-text-v2 (1536 dimensions)
+          - Model: amazon.titan-embed-text-v2 (1024 dimensions)
         - **Sparse Vector Configuration:**
           - Mode: Doc-Only (for optimal query latency)
           - Index Backend: SEISMIC (ANN for sparse vectors)
@@ -141,4 +145,4 @@ SAMPLE_CONTEXT_3 = """
 """
 
 if __name__ == "__main__":
-    print(worker_agent(SAMPLE_CONTEXT_2))
+    print(worker_agent(SAMPLE_CONTEXT_3))

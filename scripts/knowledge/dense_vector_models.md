@@ -81,7 +81,7 @@ So the providers below are **examples of common choices**, not an exhaustive lis
 
 | Provider | Model Names (Examples) | Dimensions (Typical) | Notes |
 |----------|-------------------------|----------------------|------|
-| **Amazon Bedrock** *(Default recommendation)* | `amazon.titan-embed-text-v2`<br>`cohere.embed-english-v3`<br>`cohere.embed-multilingual-v3` | 1536 / variable<br>1024<br>1024<br>1024 | Fully managed, integrated with AWS IAM. Titan v2 supports variable dimensions. |
+| **Amazon Bedrock** *(Default recommendation)* | `amazon.titan-embed-text-v2`<br>`cohere.embed-english-v3`<br>`cohere.embed-multilingual-v3` | 1024<br>1024<br>1024 | Fully managed, integrated with AWS IAM. Titan v2 supports variable dimensions. |
 | **OpenAI** | `text-embedding-3-small`<br>`text-embedding-3-large`<br>`text-embedding-ada-002` | 1536<br>3072<br>1536 | Widely adopted; requires API key. |
 | **Cohere** | `embed-english-v3.0`<br>`embed-multilingual-v3.0` | 1024 | Strong retrieval-focused embeddings. |
 

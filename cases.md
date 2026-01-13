@@ -13,4 +13,4 @@
 
 I want to build a semantic search app with 10M docs. 
  English. no budget limitation, but best search relevance
- I don't want to buy a GPU endpoint. 
+ I don't want to buy a GPU endpoint. host the sparse model on local nodes
