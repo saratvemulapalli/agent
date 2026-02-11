@@ -2,7 +2,7 @@ from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
 from scripts.opensearch_ops_tools import create_index, create_and_attach_pipeline, create_bedrock_embedding_model, create_local_pretrained_model, index_doc, delete_doc
-from scripts.tools import retrieve_from_documentation
+from scripts.tools import search_opensearch_org
 
 # -------------------------------------------------------------------------
 # System Prompt
@@ -62,7 +62,7 @@ def worker_agent(context: str) -> str:
         agent = Agent(
             model=model,
             system_prompt=SYSTEM_PROMPT,
-            tools=[create_index, retrieve_from_documentation, create_and_attach_pipeline, create_bedrock_embedding_model, create_local_pretrained_model, index_doc, delete_doc],
+            tools=[create_index, search_opensearch_org, create_and_attach_pipeline, create_bedrock_embedding_model, create_local_pretrained_model, index_doc, delete_doc],
             callback_handler=ThinkingCallbackHandler(output_color="\033[92m") # Green for worker
         )
         

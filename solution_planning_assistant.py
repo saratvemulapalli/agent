@@ -5,7 +5,7 @@ import re
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
-from scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models
+from scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models, search_opensearch_org
 from worker import SAMPLE_CONTEXT
 
 # -------------------------------------------------------------------------
@@ -30,6 +30,7 @@ Your goal is to collaborate with the user to design the best OpenSearch retrieva
 
 ## Tools & Knowledge
 *   Use `read_knowledge_base`, `read_dense_vector_models`, `read_sparse_vector_models` as your primary source of truth.
+*   Use `search_opensearch_org` when you need latest public OpenSearch documentation updates from opensearch.org.
 *   Do not fabricate benchmarks or capabilities not present in the tools.
 
 ## Constraints
@@ -87,13 +88,25 @@ model = BedrockModel(
 agent = Agent(
     model=model, 
     system_prompt=SYSTEM_PROMPT,
-    tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models],
+    tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models, search_opensearch_org],
     callback_handler=ThinkingCallbackHandler(output_color="\033[94m") # Blue output
 )
 
 # -------------------------------------------------------------------------
 # Worker Execution
 # -------------------------------------------------------------------------
+
+def _read_multiline_input() -> str:
+    """Read user input until an empty line is entered."""
+    print("\nYou:")
+    lines = []
+    while True:
+        line = input()
+        if line == "":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
 
 @tool
 def solution_planning_assistant(context: str) -> dict:
@@ -135,20 +148,21 @@ def solution_planning_assistant(context: str) -> dict:
                     "keynote": keynote
                 }
 
-            # Get user feedback
-            try:
-                user_input = input("\nYou: ").strip()
-                if not user_input:
-                    user_input = "Please continue."
-                
-                # Update input for next turn
-                current_input = user_input
-                
-            except KeyboardInterrupt:
-                return {
-                    "solution": "CANCELLED",
-                    "keynote": "User cancelled planning."
-                }
+            # Get explicit user feedback; never fabricate a user confirmation.
+            while True:
+                try:
+                    user_input = _read_multiline_input()
+                except KeyboardInterrupt:
+                    return {
+                        "solution": "CANCELLED",
+                        "keynote": "User cancelled planning."
+                    }
+
+                if user_input:
+                    current_input = user_input
+                    break
+
+                print("Please enter feedback or an explicit confirmation to continue.")
 
     except Exception as e:
         raise e

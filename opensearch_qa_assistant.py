@@ -5,7 +5,7 @@ import re
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
-from scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models
+from scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models, search_opensearch_org
 
 # -------------------------------------------------------------------------
 # System Prompt
@@ -21,7 +21,8 @@ Your goal is to answer questions related to OpenSearch semantic search.
 
 1. **Understand the Question**
 2. **Consult the Knowledge Base**: Use `read_knowledge_base`, `read_dense_vector_models`, or `read_sparse_vector_models` to check for specific details based on the topic.
-3. **Provide the Answer**: Offer a brief answer based on the knowledge base.
+3. **Use Live Docs Search When Needed**: Use `search_opensearch_org` for the latest public docs on opensearch.org.
+4. **Provide the Answer**: Offer a brief answer based on available tool evidence.
 
 ## Output
 Provide a brief response answering the question. And explain the reasoning behind the answer.
@@ -47,7 +48,7 @@ model = BedrockModel(
 agent = Agent(
     model=model, 
     system_prompt=SYSTEM_PROMPT,
-    tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models],
+    tools=[read_knowledge_base, read_dense_vector_models, read_sparse_vector_models, search_opensearch_org],
     callback_handler=ThinkingCallbackHandler(output_color="\033[96m") # Cyan output for follow-up
 )
 

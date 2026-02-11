@@ -1,14 +1,51 @@
 import os
 import sys
 import asyncio
+import atexit
+
+try:
+    # Enables line-editing/history for input() on supported terminals.
+    import readline
+except ImportError:
+    readline = None
+
+try:
+    import termios
+except ImportError:
+    termios = None
 
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
-from scripts.tools import get_sample_doc
+from scripts.tools import submit_sample_doc, get_sample_doc
 from solution_planning_assistant import solution_planning_assistant
 # from opensearch_qa_assistant import opensearch_qa_assistant # No longer used in main flow
 from worker import worker_agent
+
+
+_ORIGINAL_TTY_ATTRS = None
+if termios is not None and sys.stdin.isatty():
+    try:
+        _ORIGINAL_TTY_ATTRS = termios.tcgetattr(sys.stdin.fileno())
+    except termios.error:
+        _ORIGINAL_TTY_ATTRS = None
+
+
+"""
+Restored mode re-enables normal line editing behavior, so arrow/backspace stop appearing
+ as raw escape bytes like ^[[D.
+"""
+def _restore_tty_state() -> None:
+    """Restore stdin terminal mode if another component left it altered."""
+    if termios is None or _ORIGINAL_TTY_ATTRS is None or not sys.stdin.isatty():
+        return
+    try:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _ORIGINAL_TTY_ATTRS)
+    except termios.error:
+        pass
+
+
+atexit.register(_restore_tty_state)
 
 
 # -------------------------------------------------------------------------
@@ -22,9 +59,11 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 
 ### Workflow Phases
 
-1.  **Data Analysis (First Step)**:
-    *   call `get_sample_doc` to retrieve a sample document from the user.
-    *   Analyze the returned sample to understand the data structure, potential language, and content type.
+1.  **Collect Sample Document (Mandatory First Step)**:
+    *   Always ask the user to paste one sample document first.
+    *   Once user provides it, call `submit_sample_doc` with the exact pasted content.
+    *   Then call `get_sample_doc` and analyze it to understand data structure, potential language, and content type.
+    *   Do not skip this step.
 
 2.  **Clarify Requirements**:
     *   Based on your analysis of the sample doc, engage the user only **once** to gather REMAINING critical information.
@@ -58,12 +97,26 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 *   **Delegation**: Do NOT generate the plan yourself. Do NOT answer technical questions yourself. Always delegate to `solution_planning_assistant` for the planning and Q&A phase.
 *   **State Awareness**: The `solution_planning_assistant` is interactive. Once you call it, trust it to handle the refinement loop.
 *   **Worker Call**: You MUST call `worker_agent` immediately after the planning phase completes.
+*   **Sample Doc Gate**: Always collect and store one user-pasted sample document before clarification/planning.
 *   **Persona**: You are the interface; be helpful, polite, and professional.
 """
 
 # -------------------------------------------------------------------------
 # Orchestrator Execution
 # -------------------------------------------------------------------------
+
+def _read_multiline_input() -> str:
+    """Read user input until an empty line is entered."""
+    _restore_tty_state()
+    print("\nYou:")
+    lines = []
+    while True:
+        line = input()
+        if line == "":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
 
 async def main():
     """
@@ -89,7 +142,7 @@ async def main():
         agent = Agent(
             model=model, 
             system_prompt=SYSTEM_PROMPT,
-            tools=[get_sample_doc, solution_planning_assistant, worker_agent],
+            tools=[submit_sample_doc, get_sample_doc, solution_planning_assistant, worker_agent],
             callback_handler=ThinkingCallbackHandler()
         )
         
@@ -102,7 +155,7 @@ async def main():
 
     while True:
         try:
-            user_input = input("\nYou: ").strip()
+            user_input = _read_multiline_input()
             
             if not user_input:
                 continue
