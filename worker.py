@@ -1,8 +1,25 @@
+import json
+import re
+
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
-from scripts.opensearch_ops_tools import create_index, create_and_attach_pipeline, create_bedrock_embedding_model, create_local_pretrained_model, index_doc, delete_doc
+from scripts.opensearch_ops_tools import (
+    apply_capability_driven_verification,
+    create_index,
+    create_and_attach_pipeline,
+    create_bedrock_embedding_model,
+    create_local_pretrained_model,
+    delete_doc,
+    launch_search_ui,
+)
 from scripts.tools import search_opensearch_org
+from scripts.shared import (
+    mark_execution_completed,
+    set_last_worker_context,
+    set_last_worker_run_state,
+    get_last_worker_run_state,
+)
 
 # -------------------------------------------------------------------------
 # System Prompt
@@ -20,18 +37,318 @@ Your goal is to execute the technical plan provided in the context.
     *   **First**: Create necessary models (e.g., Bedrock embedding models, Local pretrained models).
     *   **Second**: Create the index with the correct settings and mappings.
     *   **Third**: Create the ingest pipeline and attach it to the index (this often requires models to be ready).
-    *   **Fourth (Verification)**: Index a sample document to verify the pipeline and index configuration work as expected.
-    *   **Fifth (Cleanup)**: Delete the sample document after successful verification.
+    *   **Third-A (Hybrid lexical+semantic only)**: Create and attach a search pipeline with normalization + combination weights for hybrid query score blending.
+    *   **Fourth (Capability + Verification)**: Call `apply_capability_driven_verification` using the full approved plan text and an explicit `index_name` (target index for this run). This step both parses `Search Capabilities` and indexes capability-selected verification docs.
+    *   **Fifth (UX Handoff)**: Launch the custom React Search Builder UI using `launch_search_ui` so users can run queries immediately.
+    *   **Sixth (Cleanup policy)**: Do NOT delete verification docs automatically. Keep them for user testing and clearly mention cleanup happens only when user explicitly asks.
 3.  **Report**: Confirm successful execution of all steps.
 
 ## Important Rules
 1. When using sparse vector search with SEISMIC or ANN, you should use `sparse_vector` field instead of `rank_features` field.
 2. Always verify your work by indexing a sample document.
+3. Use `apply_capability_driven_verification` for verification ingestion in this workflow.
+4. Pipeline `field_map` source fields must exist in index mapping/sample schema. Do not assume a `text` field exists.
+5. If there is no suitable text-like source field for embeddings, do not force dense-vector ingestion; proceed with lexical-only setup and report that dense vector is optional/not required for this schema.
+6. `apply_capability_driven_verification` must run before `launch_search_ui` or `delete_doc`.
+7. If any step fails, mark that step as failed in the execution report and do not claim overall success.
+8. Lock-order hard stop: if one step fails, do not execute any later step.
+9. Producer-driven boolean typing policy is strict:
+    - Use `boolean` mapping only when sample/producer values are native booleans.
+    - If producer values are string flags such as '0'/'1', map as `keyword` (do not coerce to boolean).
+10. For `knn_vector` method definitions, always set `method.engine` explicitly.
+    - Never use `nmslib` (deprecated).
+    - For `hnsw`, prefer `lucene` unless the approved plan explicitly requires `faiss`.
+    - For `ivf`, use `faiss`.
+
+## Execution Report Contract (Required)
+At the end of your response, you MUST include an exact machine-readable block:
+<execution_report>
+{"status":"success|failed","steps":{"model_setup":"success|failed|skipped","index_setup":"success|failed|skipped","pipeline_setup":"success|failed|skipped","capability_precheck":"success|failed|skipped","ui_launch":"success|failed|skipped"},"failed_step":"<step-id-or-empty>","notes":["..."]}
+</execution_report>
+
+Canonical step IDs:
+- model_setup
+- index_setup
+- pipeline_setup
+- capability_precheck
+- ui_launch
 """
 
 # -------------------------------------------------------------------------
 # Worker Execution
 # -------------------------------------------------------------------------
+
+_CANONICAL_CAPABILITY_PREFIX = re.compile(
+    r"^[-*]\s*(Exact|Semantic|Structured|Combined|Autocomplete|Fuzzy)\s*:",
+    re.IGNORECASE,
+)
+_EXECUTION_REPORT_PATTERN = re.compile(
+    r"<execution_report>(.*?)</execution_report>",
+    re.IGNORECASE | re.DOTALL,
+)
+_RESUME_WORKER_MARKER = "[RESUME_WORKER_FROM_FAILED_STEP]"
+_CANONICAL_STEP_ORDER = (
+    "model_setup",
+    "index_setup",
+    "pipeline_setup",
+    "capability_precheck",
+    "ui_launch",
+)
+_ALLOWED_STEP_STATUS = {"success", "failed", "skipped"}
+_HYBRID_WEIGHT_PROFILE_PATTERN = re.compile(
+    r"hybrid\s+weight\s+profile\s*:\s*(semantic-heavy|balanced|lexical-heavy)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_hybrid_weight_profile(context: str) -> str:
+    match = _HYBRID_WEIGHT_PROFILE_PATTERN.search(context or "")
+    if not match:
+        return ""
+    return str(match.group(1)).strip().lower()
+
+
+def _is_hybrid_context(context: str) -> bool:
+    return "hybrid" in (context or "").lower()
+
+
+def _is_lexical_semantic_hybrid_context(context: str) -> bool:
+    lowered = (context or "").lower()
+    if not _is_hybrid_context(lowered):
+        return False
+
+    lexical_negative_signals = (
+        "no bm25",
+        "without bm25",
+        "no lexical component",
+        "bm25 component is redundant",
+    )
+    if any(signal in lowered for signal in lexical_negative_signals):
+        return False
+
+    lexical_signals = (
+        "bm25",
+        "lexical",
+        "keyword search",
+        "inverted index",
+    )
+    semantic_signals = (
+        "dense vector",
+        "semantic",
+        "neural",
+        "embedding",
+    )
+
+    has_lexical = any(signal in lowered for signal in lexical_signals)
+    has_semantic = any(signal in lowered for signal in semantic_signals)
+    return has_lexical and has_semantic
+
+
+def _resolve_hybrid_search_pipeline_weights(context: str) -> tuple[bool, list[float], str]:
+    if not _is_lexical_semantic_hybrid_context(context):
+        return False, [0.5, 0.5], ""
+
+    profile = _extract_hybrid_weight_profile(context)
+    profile_map: dict[str, list[float]] = {
+        "semantic-heavy": [0.2, 0.8],  # [lexical, semantic]
+        "balanced": [0.5, 0.5],        # [lexical, semantic]
+        "lexical-heavy": [0.8, 0.2],   # [lexical, semantic]
+    }
+
+    if profile in profile_map:
+        return True, profile_map[profile], profile
+    return True, profile_map["balanced"], "balanced"
+
+
+def _has_canonical_search_capabilities(context: str) -> bool:
+    in_section = False
+    parsed_count = 0
+
+    for raw_line in context.splitlines():
+        line = raw_line.strip()
+        lowered = line.lower()
+
+        if not in_section and "search capabilities" in lowered:
+            in_section = True
+            continue
+
+        if not in_section:
+            continue
+
+        if not line:
+            if parsed_count > 0:
+                break
+            continue
+
+        if line.startswith("##") or line.startswith("---"):
+            break
+
+        if not (line.startswith("-") or line.startswith("*")):
+            if parsed_count > 0:
+                break
+            continue
+
+        if _CANONICAL_CAPABILITY_PREFIX.match(line):
+            parsed_count += 1
+            continue
+
+        return False
+
+    return parsed_count > 0
+
+
+def _strip_resume_marker(context: str) -> tuple[bool, str]:
+    text = (context or "").strip()
+    if text.startswith(_RESUME_WORKER_MARKER):
+        return True, text[len(_RESUME_WORKER_MARKER):].strip()
+    return False, text
+
+
+def _extract_execution_report(response_text: str) -> dict | None:
+    matches = _EXECUTION_REPORT_PATTERN.findall(response_text or "")
+    if not matches:
+        return None
+    raw = matches[-1].strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _first_failed_step(report: dict) -> str:
+    steps = report.get("steps", {}) if isinstance(report, dict) else {}
+    if not isinstance(steps, dict):
+        return ""
+    for step in _CANONICAL_STEP_ORDER:
+        if str(steps.get(step, "")).lower() == "failed":
+            return step
+    return ""
+
+
+def _enforce_fail_stop_order(steps: dict[str, str]) -> tuple[dict[str, str], str]:
+    """Enforce lock-order semantics: once a step fails, all following steps are skipped."""
+    normalized: dict[str, str] = {}
+    failed_step = ""
+    stop = False
+
+    for step in _CANONICAL_STEP_ORDER:
+        value = str(steps.get(step, "skipped")).strip().lower()
+        status = value if value in _ALLOWED_STEP_STATUS else "skipped"
+
+        if stop:
+            normalized[step] = "skipped"
+            continue
+
+        if status == "failed":
+            normalized[step] = "failed"
+            failed_step = step
+            stop = True
+            continue
+
+        normalized[step] = status
+
+    return normalized, failed_step
+
+
+def _normalize_report(report: dict | None) -> dict:
+    steps: dict[str, str] = {step: "skipped" for step in _CANONICAL_STEP_ORDER}
+    if isinstance(report, dict):
+        provided_steps = report.get("steps", {})
+        if isinstance(provided_steps, dict):
+            for step in _CANONICAL_STEP_ORDER:
+                value = str(provided_steps.get(step, "skipped")).strip().lower()
+                steps[step] = value if value in _ALLOWED_STEP_STATUS else "skipped"
+
+    steps, failed_step = _enforce_fail_stop_order(steps)
+    status = "failed" if failed_step else "success"
+    if status == "failed" and not failed_step:
+        failed_step = "unknown"
+
+    notes: list[str] = []
+    if isinstance(report, dict):
+        raw_notes = report.get("notes", [])
+        if isinstance(raw_notes, list):
+            notes = [str(item).strip() for item in raw_notes if str(item).strip()]
+        elif isinstance(raw_notes, str) and raw_notes.strip():
+            notes = [raw_notes.strip()]
+        explicit_failed = str(report.get("failed_step", "")).strip()
+        if explicit_failed and not failed_step:
+            if explicit_failed in steps:
+                steps[explicit_failed] = "failed"
+                steps, failed_step = _enforce_fail_stop_order(steps)
+                status = "failed"
+
+    return {
+        "status": status,
+        "steps": steps,
+        "failed_step": failed_step if status == "failed" else "",
+        "notes": notes,
+    }
+
+
+def _build_fallback_failed_report(reason: str, failed_step: str = "unknown") -> dict:
+    steps = {step: "skipped" for step in _CANONICAL_STEP_ORDER}
+    if failed_step in steps:
+        steps[failed_step] = "failed"
+    return {
+        "status": "failed",
+        "steps": steps,
+        "failed_step": failed_step,
+        "notes": [reason],
+    }
+
+
+def _merge_resume_progress(report: dict, previous_steps: dict, resume_step: str) -> dict:
+    merged = dict(report)
+    steps = dict(merged.get("steps", {}))
+    resume_index = _CANONICAL_STEP_ORDER.index(resume_step) if resume_step in _CANONICAL_STEP_ORDER else 0
+    for step in _CANONICAL_STEP_ORDER[:resume_index]:
+        if str(previous_steps.get(step, "")).lower() == "success":
+            steps[step] = "success"
+    steps, failed_step = _enforce_fail_stop_order(steps)
+    merged["steps"] = steps
+    merged["status"] = "failed" if failed_step else "success"
+    merged["failed_step"] = failed_step if failed_step else ""
+    return merged
+
+
+def _render_execution_report_block(report: dict) -> str:
+    return "<execution_report>\n" + json.dumps(report, ensure_ascii=False) + "\n</execution_report>"
+
+
+def _store_worker_run_state(execution_context: str, report: dict, report_raw: str) -> None:
+    previous_state = get_last_worker_run_state()
+    previous_context = str(previous_state.get("context", "")).strip() if isinstance(previous_state, dict) else ""
+    try:
+        previous_attempt = int(previous_state.get("attempt", 0)) if isinstance(previous_state, dict) else 0
+    except Exception:
+        previous_attempt = 0
+    attempt = previous_attempt + 1 if previous_context == execution_context else 1
+
+    set_last_worker_context(execution_context)
+    set_last_worker_run_state(
+        {
+            "context": execution_context,
+            "failed_step": report.get("failed_step", ""),
+            "steps": dict(report.get("steps", {})),
+            "last_report_raw": report_raw,
+            "attempt": attempt,
+            "status": report.get("status", "failed"),
+        }
+    )
+
+
+def _finalize_worker_response(response_text: str, execution_context: str, report: dict) -> str:
+    report_block = _render_execution_report_block(report)
+    final_text = response_text.rstrip() + "\n\n" + report_block
+    _store_worker_run_state(execution_context, report, report_block)
+    mark_execution_completed()
+    return final_text
+
 
 @tool
 def worker_agent(context: str) -> str:
@@ -48,6 +365,48 @@ def worker_agent(context: str) -> str:
     model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
     
     try:
+        resume_mode, execution_context = _strip_resume_marker(context)
+        previous_state = get_last_worker_run_state() if resume_mode else {}
+        resume_step = ""
+        previous_steps: dict[str, str] = {}
+
+        if resume_mode:
+            if not execution_context and isinstance(previous_state, dict):
+                execution_context = str(previous_state.get("context", "")).strip()
+            resume_step = str(previous_state.get("failed_step", "")).strip() if isinstance(previous_state, dict) else ""
+            previous_steps = (
+                dict(previous_state.get("steps", {}))
+                if isinstance(previous_state, dict) and isinstance(previous_state.get("steps", {}), dict)
+                else {}
+            )
+            if not execution_context or not resume_step:
+                report = _build_fallback_failed_report(
+                    "Recovery precondition failed: no recoverable checkpoint context/failed_step found.",
+                    failed_step="unknown",
+                )
+                return _finalize_worker_response(
+                    "Recovery precondition failed: no recoverable checkpoint found. Run full execution first.",
+                    execution_context or "",
+                    report,
+                )
+
+        if not _has_canonical_search_capabilities(execution_context):
+            report = _build_fallback_failed_report(
+                "Missing canonical Search Capabilities section in worker context.",
+                failed_step="capability_precheck",
+            )
+            return _finalize_worker_response(
+                "Precondition failed: missing canonical 'Search Capabilities' section in worker context. "
+                "Expected applicable bullets prefixed with Exact:/Semantic:/Structured:/Combined:/Autocomplete:/Fuzzy:."
+                ,
+                execution_context,
+                report,
+            )
+
+        requires_hybrid_search_pipeline, hybrid_weights, hybrid_profile = _resolve_hybrid_search_pipeline_weights(
+            execution_context
+        )
+
         model = BedrockModel(
             model_id=model_id,
             max_tokens=8192,
@@ -62,17 +421,94 @@ def worker_agent(context: str) -> str:
         agent = Agent(
             model=model,
             system_prompt=SYSTEM_PROMPT,
-            tools=[create_index, search_opensearch_org, create_and_attach_pipeline, create_bedrock_embedding_model, create_local_pretrained_model, index_doc, delete_doc],
+            tools=[
+                create_index,
+                search_opensearch_org,
+                create_and_attach_pipeline,
+                apply_capability_driven_verification,
+                create_bedrock_embedding_model,
+                create_local_pretrained_model,
+                launch_search_ui,
+                delete_doc,
+            ],
             callback_handler=ThinkingCallbackHandler(output_color="\033[92m") # Green for worker
         )
         
-        instruction = f"Here is the approved plan:\n{context}\nPlease implement this plan."
+        instruction = (
+            f"Here is the approved plan:\n{execution_context}\n"
+            "Please implement this plan.\n"
+            "Capability alignment step (must run after pipeline setup and before verification docs):\n"
+            "- Call apply_capability_driven_verification with worker_output set to the full approved plan text above and explicit index_name for this run.\n"
+            "- This call also indexes capability-selected verification docs (count=10 by default).\n"
+            "- Do not omit index_name in that call.\n"
+            "- Continue even if capability coverage is partial; capture any notes in your final report.\n"
+            "Verification requirements:\n"
+            "- Keep verification docs for interactive testing.\n"
+            "- Launch UI with launch_search_ui only when verification is clean (indexed_count > 0 and errors is empty).\n"
+            "- Do not perform cleanup unless the user explicitly asks.\n"
+            "Search capabilities precondition:\n"
+            "- The provided context includes canonical 'Search Capabilities' from solution_planning_assistant.\n"
+            "- Treat planner-provided search capabilities as authoritative for verification/suggestion alignment.\n"
+            "Schema alignment requirements:\n"
+            "- Use only existing source fields from sample/index mapping for pipeline field_map.\n"
+            "- Do not invent a `text` source field if it does not exist.\n"
+            "- If no suitable source field exists for embeddings, skip embedding pipeline/model and continue with lexical indexing.\n"
+            "- Enforce producer-driven boolean typing: map fields as boolean only for native booleans; map string flags ('0'/'1') as keyword.\n"
+            "Mandatory final output:\n"
+            "- End your response with exactly one <execution_report> JSON block with canonical step IDs and statuses.\n"
+            "- If any step fails, set status='failed' and set failed_step to the earliest failed canonical step.\n"
+            "- Lock-order hard stop: do not execute any later step after the first failed step."
+        )
+        if requires_hybrid_search_pipeline:
+            instruction += (
+                "\nHybrid lexical+semantic pipeline requirements:\n"
+                f"- Detected hybrid weight profile: {hybrid_profile}.\n"
+                f"- Use hybrid query weight order [lexical, semantic] with weights {hybrid_weights}.\n"
+                "- You MUST create and attach a search pipeline by calling create_and_attach_pipeline.\n"
+                "- Call signature requirements: pipeline_type='search', is_hybrid_search=True, "
+                f"hybrid_weights={hybrid_weights}.\n"
+                "- You MAY pass pipeline_body={} to use default Step-3 hybrid normalization pipeline generation.\n"
+                "- Ensure index.search.default_pipeline is attached to the target index.\n"
+            )
+
+        if resume_mode:
+            succeeded_before: list[str] = []
+            if resume_step in _CANONICAL_STEP_ORDER:
+                resume_index = _CANONICAL_STEP_ORDER.index(resume_step)
+                for step in _CANONICAL_STEP_ORDER[:resume_index]:
+                    if str(previous_steps.get(step, "")).lower() == "success":
+                        succeeded_before.append(step)
+            instruction += (
+                "\nRecovery mode:\n"
+                f"- Resume from failed step: {resume_step}\n"
+                "- Do not redo steps that already succeeded before this step.\n"
+                f"- Previously successful steps before resume point: {succeeded_before}\n"
+                "- Preserve already-created resources and proceed from the failure point.\n"
+            )
         
         response = agent(instruction)
-        return str(response)
+        response_text = str(response)
+        parsed_report = _extract_execution_report(response_text)
+        if parsed_report is None:
+            normalized_report = _build_fallback_failed_report(
+                "Worker response missing/invalid <execution_report> JSON block.",
+                failed_step="unknown",
+            )
+        else:
+            normalized_report = _normalize_report(parsed_report)
+
+        if resume_mode:
+            normalized_report = _merge_resume_progress(normalized_report, previous_steps, resume_step)
+
+        return _finalize_worker_response(response_text, execution_context, normalized_report)
 
     except Exception as e:
-        return f"Error executing worker agent: {str(e)}"
+        execution_context = _strip_resume_marker(context)[1]
+        fallback = _build_fallback_failed_report(
+            f"Unhandled worker exception: {e}",
+            failed_step="unknown",
+        )
+        return _finalize_worker_response(f"Error executing worker agent: {str(e)}", execution_context, fallback)
 
 SAMPLE_CONTEXT = """
 **Corpus Details:**
