@@ -2,35 +2,45 @@ import json
 import os
 import re
 import csv
+import math
 from typing import Any, Dict, Optional
 from pathlib import Path
 from html import unescape
 from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 
-from strands import tool
-from scripts.shared import text_richness_score
-
-_SAMPLE_DOC: Optional[Dict[str, Any]] = None
-_SAMPLE_SOURCE_LOCAL_FILE: Optional[str] = None
-_INGEST_SOURCE_FIELD_HINTS: tuple[str, ...] = ()
-
-
-def clear_sample_doc() -> None:
-    """Clear the stored sample document (used on workflow reset)."""
-    global _SAMPLE_DOC, _SAMPLE_SOURCE_LOCAL_FILE, _INGEST_SOURCE_FIELD_HINTS
-    _SAMPLE_DOC = None
-    _SAMPLE_SOURCE_LOCAL_FILE = None
-    _INGEST_SOURCE_FIELD_HINTS = ()
+from scripts.shared import (
+    SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX,
+    SUPPORTED_SAMPLE_FILE_FORMATS_COMMA,
+    text_richness_score,
+)
 
 
-def set_ingest_source_field_hints(fields: list[str] | tuple[str, ...] | None) -> None:
-    """Store source field hints extracted from ingest pipeline field_map."""
-    global _INGEST_SOURCE_FIELD_HINTS
+_LOCAL_PATH_WITH_SUPPORTED_EXTENSION_PATTERN = re.compile(
+    rf"[^\s,;]+(?:{SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX})\b",
+    flags=re.IGNORECASE,
+)
+_INLINE_RELATIVE_PATH_WITH_SUPPORTED_EXTENSION_PATTERN = re.compile(
+    rf"(?:\./|\../)?[^\s,;]+(?:{SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX})\b",
+    flags=re.IGNORECASE,
+)
+
+
+def normalize_ingest_source_field_hints(
+    fields: list[str] | tuple[str, ...] | str | None,
+) -> tuple[str, ...]:
+    """Normalize source field hints into a deduplicated, lowercased tuple.
+
+    Accepts a list, tuple, comma-separated string, or None.
+    """
+    if fields is None:
+        return ()
+
+    if isinstance(fields, str):
+        fields = [f.strip() for f in fields.split(",") if f.strip()]
 
     if not fields:
-        _INGEST_SOURCE_FIELD_HINTS = ("text",)
-        return
+        return ("text",)
 
     normalized: list[str] = []
     seen: set[str] = set()
@@ -41,10 +51,10 @@ def set_ingest_source_field_hints(fields: list[str] | tuple[str, ...] | None) ->
         seen.add(name)
         normalized.append(name)
 
-    _INGEST_SOURCE_FIELD_HINTS = tuple(normalized) if normalized else ()
+    return tuple(normalized) if normalized else ()
 
 
-@tool
+
 def read_knowledge_base() -> str:
     """Read the OpenSearch Semantic Search Guide to retrieve detailed information about search methods.
 
@@ -62,7 +72,7 @@ def read_knowledge_base() -> str:
     except Exception as e:
         return f"Error reading knowledge base: {e}"
 
-@tool
+
 def read_dense_vector_models() -> str:
     """Read the Dense Vector Models Guide to retrieve available models for Dense Vector Search.
 
@@ -76,7 +86,7 @@ def read_dense_vector_models() -> str:
     except Exception as e:
         return f"Error reading dense vector models guide: {e}"
 
-@tool
+
 def read_sparse_vector_models() -> str:
     """Read the Sparse Vector Models Guide to retrieve available models for Sparse Vector Search.
 
@@ -90,30 +100,17 @@ def read_sparse_vector_models() -> str:
     except Exception as e:
         return f"Error reading sparse vector models guide: {e}"
 
-@tool
-def get_sample_doc() -> str:
-    """Get the stored sample document provided by the user.
-    
-    Returns:
-        str: The sample document JSON string, or MISSING_SAMPLE_DOC if not set.
-    """
-    if _SAMPLE_DOC is None:
-        return "MISSING_SAMPLE_DOC"
-    return json.dumps(_SAMPLE_DOC, ensure_ascii=False)
 
 
-@tool
 def submit_sample_doc(doc: str) -> str:
-    """Store a sample document provided by the user.
+    """Parse a sample document provided by the user.
 
     Args:
         doc: User-provided sample document, preferably JSON.
 
     Returns:
-        str: Status message indicating success or validation error.
+        str: JSON string with ``sample_doc`` on success, or an error message.
     """
-    global _SAMPLE_DOC, _SAMPLE_SOURCE_LOCAL_FILE
-
     raw = doc.strip()
     if not raw:
         return "Error: sample doc is empty."
@@ -123,12 +120,12 @@ def submit_sample_doc(doc: str) -> str:
         if not isinstance(parsed, dict):
             return "Error: sample doc must be a JSON object."
     except json.JSONDecodeError:
-        # Fallback: treat plain text as content field.
         parsed = {"content": raw}
 
-    _SAMPLE_DOC = parsed
-    _SAMPLE_SOURCE_LOCAL_FILE = None
-    return "Sample document stored."
+    return json.dumps(
+        {"status": "Sample document stored.", "sample_doc": parsed},
+        ensure_ascii=False,
+    )
 
 
 def _expand_local_path(path_text: str) -> Path:
@@ -153,11 +150,7 @@ def _extract_path_candidate(path_or_text: str) -> str:
         or raw.startswith("/")
         or raw.startswith("./")
         or raw.startswith("../")
-        or re.fullmatch(
-            r"[^\s,;]+\.(tsv|tab|csv|jsonl|ndjson|json|txt)",
-            raw,
-            flags=re.IGNORECASE,
-        )
+        or _LOCAL_PATH_WITH_SUPPORTED_EXTENSION_PATTERN.fullmatch(raw)
     ):
         candidates.append(raw)
 
@@ -170,12 +163,8 @@ def _extract_path_candidate(path_or_text: str) -> str:
     # Unquoted inline path token inside free-form text.
     for match in re.finditer(r"(~\/[^\s,;]+|\/[^\s,;]+)", text):
         candidates.append(match.group(1))
-    for match in re.finditer(
-        r"((?:\./|\../)?[^\s,;]+\.(?:tsv|tab|csv|jsonl|ndjson|json|txt))",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        candidates.append(match.group(1))
+    for match in _INLINE_RELATIVE_PATH_WITH_SUPPORTED_EXTENSION_PATTERN.finditer(text):
+        candidates.append(match.group(0))
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -214,6 +203,139 @@ def _extract_url_candidate(url_or_text: str) -> str:
     return match.group(0).rstrip(").,;")
 
 
+def _strip_trailing_index_punctuation(index_text: str) -> str:
+    # Free-form prompts often end index names with sentence punctuation.
+    return index_text.rstrip(").,;!?:")
+
+
+def _extract_index_candidate(index_or_text: str) -> str:
+    text = (index_or_text or "").strip()
+    if not text:
+        return ""
+
+    stop_words = {
+        "please",
+        "data",
+        "dataset",
+        "localhost",
+        "opensearch",
+        "local",
+        "existing",
+        "already",
+        "index",
+        "indices",
+        "this",
+        "that",
+        "there",
+        "here",
+        "from",
+        "with",
+    }
+
+    raw = _strip_trailing_index_punctuation(text.strip('"').strip("'"))
+    if re.fullmatch(r"[A-Za-z0-9._-]+", raw) and raw.lower() not in stop_words:
+        return raw
+
+    url_candidate = _extract_url_candidate(text)
+    if url_candidate:
+        parsed = urlparse(url_candidate)
+        if parsed.path:
+            for segment in [p for p in parsed.path.split("/") if p]:
+                if segment.startswith("_"):
+                    continue
+                sanitized_segment = _strip_trailing_index_punctuation(segment)
+                if (
+                    re.fullmatch(r"[A-Za-z0-9._-]+", sanitized_segment)
+                    and sanitized_segment.lower() not in stop_words
+                ):
+                    return sanitized_segment
+
+    patterns = (
+        r"(?:index[_\s-]*name)\s*(?:=|:)?\s*([A-Za-z0-9._-]+)",
+        r"(?:index)\s*(?:=|:)\s*([A-Za-z0-9._-]+)",
+        r"(?:index)\s+(?!name\b)([A-Za-z0-9._-]+)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            candidate = _strip_trailing_index_punctuation(match.group(1).strip())
+            if (
+                re.fullmatch(r"[A-Za-z0-9._-]+", candidate)
+                and candidate.lower() not in stop_words
+            ):
+                return candidate
+
+    return ""
+
+
+def _list_localhost_non_system_indices(opensearch_client) -> tuple[list[tuple[str, int]], Optional[str]]:
+    try:
+        indices = opensearch_client.cat.indices(format="json")
+    except Exception as e:
+        return [], f"Error: failed to list local indices: {e}"
+
+    ranked_indices: list[tuple[str, int]] = []
+    for item in indices or []:
+        name = str(item.get("index", "")).strip()
+        if not name or name.startswith("."):
+            continue
+        raw_count = str(item.get("docs.count", "0")).replace(",", "").strip()
+        try:
+            count = int(float(raw_count)) if raw_count else 0
+        except ValueError:
+            count = 0
+        ranked_indices.append((name, max(0, count)))
+
+    if not ranked_indices:
+        return [], "Error: no non-system indices found on localhost OpenSearch."
+    ranked_indices.sort(key=lambda pair: pair[1], reverse=True)
+    return ranked_indices, None
+
+
+def _format_index_options(index_counts: list[tuple[str, int]], limit: int = 20) -> str:
+    if not index_counts:
+        return ""
+    lines = [
+        f"- {name} (docs={count:,})"
+        for name, count in index_counts[: max(1, limit)]
+    ]
+    return "\n".join(lines)
+
+
+def _create_local_opensearch_client():
+    from opensearchpy import OpenSearch
+
+    host = os.getenv("OPENSEARCH_HOST", "localhost")
+    port = int(os.getenv("OPENSEARCH_PORT", "9200"))
+    user = os.getenv("OPENSEARCH_USER", "admin")
+    password = os.getenv("OPENSEARCH_PASSWORD", "myStrongPassword123!")
+
+    def _build(use_ssl: bool) -> OpenSearch:
+        return OpenSearch(
+            hosts=[{"host": host, "port": port}],
+            use_ssl=use_ssl,
+            verify_certs=False,
+            ssl_show_warn=False,
+            http_auth=(user, password),
+        )
+
+    errors: list[str] = []
+    for use_ssl in (True, False):
+        scheme = "https" if use_ssl else "http"
+        client = _build(use_ssl=use_ssl)
+        try:
+            client.info()
+            return client, None
+        except Exception as e:
+            errors.append(f"{scheme}: {e}")
+
+    error_summary = "; ".join(errors) if errors else "unknown connection error"
+    return None, (
+        f"Error: unable to connect to local OpenSearch at {host}:{port}. "
+        f"Tried HTTPS and HTTP. Details: {error_summary}"
+    )
+
+
 def _normalize_cell_value(value: str) -> Any:
     text = value.strip()
     if text in {"\\N", "NULL", "null", ""}:
@@ -223,7 +345,8 @@ def _normalize_cell_value(value: str) -> Any:
 
 _TABULAR_EXTENSIONS = {".tsv", ".tab", ".csv"}
 _LINE_BASED_EXTENSIONS = _TABULAR_EXTENSIONS | {".jsonl", ".ndjson", ".txt"}
-_SUPPORTED_LOCAL_DATA_EXTENSIONS = _LINE_BASED_EXTENSIONS | {".json"}
+_PARQUET_EXTENSIONS = {".parquet"}
+_SUPPORTED_LOCAL_DATA_EXTENSIONS = _LINE_BASED_EXTENSIONS | {".json"} | _PARQUET_EXTENSIONS
 _SCRIPT_LABELS = {
     "latin": "Latin",
     "cyrillic": "Cyrillic",
@@ -237,7 +360,131 @@ _SCRIPT_LABELS = {
 }
 
 
-def _pick_directory_sample_file(directory: Path, limit: int = 500) -> tuple[Optional[Path], int]:
+def _to_json_compatible_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, dict):
+        return {
+            str(k): _to_json_compatible_value(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_compatible_value(item) for item in value]
+
+    item_method = getattr(value, "item", None)
+    if callable(item_method):
+        try:
+            return _to_json_compatible_value(item_method())
+        except Exception:
+            pass
+
+    isoformat_method = getattr(value, "isoformat", None)
+    if callable(isoformat_method):
+        try:
+            return isoformat_method()
+        except Exception:
+            pass
+
+    return str(value)
+
+
+def _normalize_record_for_json(record: dict[str, Any]) -> Dict[str, Any]:
+    normalized: Dict[str, Any] = {}
+    for idx, (key, value) in enumerate(record.items()):
+        normalized_key = str(key).strip() or f"field_{idx + 1}"
+        normalized[normalized_key] = _to_json_compatible_value(value)
+    return normalized
+
+
+def _extract_parquet_columns(candidate_path: Path) -> set[str]:
+    try:
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
+
+        parquet_file = pq.ParquetFile(candidate_path)
+        names = list(parquet_file.schema.names or [])
+        return {str(name).strip().lower() for name in names if str(name).strip()}
+    except Exception:
+        return set()
+
+
+def _load_records_from_parquet_file(
+    file_path: Path, limit: int = 10
+) -> tuple[list[Dict[str, Any]], Optional[str]]:
+    effective_limit = max(1, min(limit, 200))
+    docs: list[Dict[str, Any]] = []
+    backend_errors: list[str] = []
+
+    try:
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
+
+        table = pq.read_table(file_path)
+        for record in table.slice(0, effective_limit).to_pylist():
+            if isinstance(record, dict):
+                docs.append(_normalize_record_for_json(record))
+                if len(docs) >= effective_limit:
+                    break
+        if docs:
+            return docs, None
+    except Exception as e:
+        backend_errors.append(f"pyarrow: {e}")
+
+    try:
+        import pandas as pd  # type: ignore[import-not-found]
+
+        frame = pd.read_parquet(file_path)
+        if not frame.empty:
+            for record in frame.head(effective_limit).to_dict(orient="records"):
+                if isinstance(record, dict):
+                    docs.append(_normalize_record_for_json(record))
+                    if len(docs) >= effective_limit:
+                        break
+        if docs:
+            return docs, None
+    except Exception as e:
+        backend_errors.append(f"pandas: {e}")
+
+    if backend_errors:
+        return (
+            [],
+            f"Error reading parquet file '{file_path}': {'; '.join(backend_errors)}",
+        )
+    return (
+        [],
+        f"Error: parquet support requires pyarrow or pandas+parquet engine to read '{file_path}'.",
+    )
+
+
+def _estimate_parquet_record_count(file_path: Path) -> Optional[int]:
+    try:
+        import pyarrow.parquet as pq  # type: ignore[import-not-found]
+
+        parquet_file = pq.ParquetFile(file_path)
+        metadata = parquet_file.metadata
+        if metadata is None:
+            return None
+        row_count = metadata.num_rows
+        return max(0, int(row_count))
+    except Exception:
+        return None
+
+
+def _pick_directory_sample_file(
+    directory: Path,
+    limit: int = 500,
+    ingest_source_field_hints: tuple[str, ...] = (),
+) -> tuple[Optional[Path], int]:
     def _extract_candidate_fields(candidate_path: Path) -> set[str]:
         extension = candidate_path.suffix.lower()
 
@@ -270,6 +517,9 @@ def _pick_directory_sample_file(directory: Path, limit: int = 500) -> tuple[Opti
                                 if str(key).strip()
                             }
                         return set()
+
+            if extension in _PARQUET_EXTENSIONS:
+                return _extract_parquet_columns(candidate_path)
         except Exception:
             return set()
 
@@ -295,11 +545,12 @@ def _pick_directory_sample_file(directory: Path, limit: int = 500) -> tuple[Opti
         ".csv": 2,
         ".jsonl": 3,
         ".ndjson": 4,
-        ".json": 5,
-        ".txt": 6,
+        ".parquet": 5,
+        ".json": 6,
+        ".txt": 7,
     }
 
-    preferred_fields = set(_INGEST_SOURCE_FIELD_HINTS)
+    preferred_fields = set(ingest_source_field_hints)
     field_match_score: dict[Path, int] = {}
     for candidate in candidates:
         candidate_fields = _extract_candidate_fields(candidate)
@@ -378,6 +629,12 @@ def _estimate_line_count(file_path: Path, sample_lines: int = 4000) -> int:
 
 def _estimate_record_count(file_path: Path) -> tuple[Optional[int], str]:
     extension = file_path.suffix.lower()
+    if extension in _PARQUET_EXTENSIONS:
+        parquet_count = _estimate_parquet_record_count(file_path)
+        if parquet_count is None:
+            return None, "unknown"
+        return parquet_count, "exact"
+
     if extension not in _LINE_BASED_EXTENSIONS:
         return None, "unknown"
 
@@ -484,6 +741,14 @@ def _infer_language_hint(parsed_doc: Dict[str, Any]) -> str:
 
 
 def _load_sample_record_from_file(file_path: Path) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if file_path.suffix.lower() in _PARQUET_EXTENSIONS:
+        docs, parse_error = _load_records_from_parquet_file(file_path, limit=1)
+        if parse_error is not None:
+            return None, parse_error
+        if not docs:
+            return None, f"Error: no records found in file '{file_path}'."
+        return docs[0], None
+
     try:
         lines = []
         with file_path.open("r", encoding="utf-8", errors="replace") as handle:
@@ -536,6 +801,8 @@ def _load_sample_record_from_file(file_path: Path) -> tuple[Optional[Dict[str, A
 
 def _load_records_from_local_file(file_path: Path, limit: int = 10) -> tuple[list[Dict[str, Any]], Optional[str]]:
     effective_limit = max(1, min(limit, 200))
+    if file_path.suffix.lower() in _PARQUET_EXTENSIONS:
+        return _load_records_from_parquet_file(file_path, effective_limit)
 
     try:
         lines: list[str] = []
@@ -591,41 +858,186 @@ def _load_records_from_local_file(file_path: Path, limit: int = 10) -> tuple[lis
     return docs, None
 
 
-def get_sample_docs_payload(limit: int = 10) -> list[Dict[str, Any]]:
-    """Return sample docs for verification from local source when available."""
-    effective_limit = max(1, min(limit, 200))
+def _normalize_index_name(index_or_text: str) -> str:
+    candidate = _extract_index_candidate(index_or_text)
+    if candidate:
+        return candidate
 
-    if _SAMPLE_SOURCE_LOCAL_FILE:
-        file_path = Path(_SAMPLE_SOURCE_LOCAL_FILE)
+    raw = _strip_trailing_index_punctuation(
+        (index_or_text or "").strip().strip('"').strip("'")
+    )
+    if raw and re.fullmatch(r"[A-Za-z0-9._-]+", raw):
+        return raw
+    return ""
+
+
+def _load_records_from_localhost_index(
+    index_or_text: str,
+    limit: int = 10,
+) -> tuple[list[Dict[str, Any]], Optional[str]]:
+    effective_limit = max(1, min(limit, 200))
+    index_name = _normalize_index_name(index_or_text)
+    if not index_name:
+        return [], "Error: could not detect a valid localhost index name."
+
+    try:
+        opensearch_client, connect_error = _create_local_opensearch_client()
+    except Exception as e:
+        return [], f"Error: failed to initialize OpenSearch client: {e}"
+
+    if connect_error is not None or opensearch_client is None:
+        return [], connect_error or "Error: unable to connect to local OpenSearch."
+
+    try:
+        exists = opensearch_client.indices.exists(index=index_name)
+        if not bool(exists):
+            return [], f"Error: index '{index_name}' was not found on local OpenSearch."
+    except Exception as e:
+        return [], f"Error: failed to validate index '{index_name}': {e}"
+
+    try:
+        response = opensearch_client.search(
+            index=index_name,
+            body={
+                "size": effective_limit,
+                "query": {"match_all": {}},
+                "sort": [{"_doc": "asc"}],
+                "track_total_hits": False,
+            },
+        )
+    except Exception as e:
+        return [], f"Error: failed to fetch sample documents from index '{index_name}': {e}"
+
+    hits = (
+        response.get("hits", {}).get("hits", [])
+        if isinstance(response, dict)
+        else []
+    )
+    if not hits:
+        return [], f"Error: index '{index_name}' has no documents."
+
+    docs: list[Dict[str, Any]] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        source = hit.get("_source")
+        if isinstance(source, dict):
+            docs.append(source)
+        elif source is None:
+            fallback = hit.get("fields")
+            if isinstance(fallback, dict):
+                docs.append(fallback)
+            else:
+                doc_id = str(hit.get("_id", "")).strip()
+                if doc_id:
+                    docs.append({"_id": doc_id})
+        else:
+            docs.append({"content": str(source)})
+        if len(docs) >= effective_limit:
+            break
+
+    if not docs:
+        return [], f"Error: index '{index_name}' has no readable documents."
+    return docs[:effective_limit], None
+
+
+def get_sample_docs_payload(
+    limit: int = 10,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> list[Dict[str, Any]]:
+    """Return sample docs for verification from local source when available.
+
+    Args:
+        limit: Maximum number of documents to return.
+        sample_doc_json: JSON string of a single sample document.
+        source_local_file: Path to the local file the sample was loaded from.
+        source_index_name: Localhost OpenSearch index name used as sample source.
+    """
+    effective_limit = max(1, min(limit, 200))
+    parsed_sample_doc: Dict[str, Any] | None = None
+    detected_source_index = _normalize_index_name(source_index_name)
+
+    parsed_payload: Any = None
+    if sample_doc_json:
+        try:
+            parsed_payload = json.loads(sample_doc_json)
+        except (json.JSONDecodeError, TypeError):
+            parsed_payload = None
+
+    if isinstance(parsed_payload, dict):
+        payload_sample_doc = parsed_payload.get("sample_doc")
+        if isinstance(payload_sample_doc, dict):
+            parsed_sample_doc = payload_sample_doc
+        elif "sample_doc" not in parsed_payload:
+            parsed_sample_doc = parsed_payload
+
+        if not detected_source_index and bool(parsed_payload.get("source_localhost_index")):
+            detected_source_index = _normalize_index_name(
+                str(parsed_payload.get("source_index_name", ""))
+            )
+
+    if source_local_file:
+        file_path = Path(source_local_file)
         if file_path.exists() and file_path.is_file():
             docs, _ = _load_records_from_local_file(file_path, effective_limit)
             if docs:
                 return docs[:effective_limit]
 
-    if _SAMPLE_DOC is None:
-        return []
-    return [dict(_SAMPLE_DOC)]
+    if detected_source_index:
+        docs, _ = _load_records_from_localhost_index(detected_source_index, effective_limit)
+        if docs:
+            return docs[:effective_limit]
+
+    if isinstance(parsed_sample_doc, dict):
+        return [parsed_sample_doc]
+    return []
 
 
-@tool
-def get_sample_docs_for_verification(limit: int = 10) -> str:
-    """Return sample docs for verification indexing as JSON array."""
-    return json.dumps(get_sample_docs_payload(limit), ensure_ascii=False)
+
+def get_sample_docs_for_verification(
+    limit: int = 10,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> str:
+    """Return sample docs for verification indexing as JSON array.
+
+    Args:
+        limit: Maximum number of documents to return.
+        sample_doc_json: JSON string of a single sample document.
+        source_local_file: Path to the local file the sample was loaded from.
+        source_index_name: Localhost OpenSearch index name used as sample source.
+    """
+    return json.dumps(
+        get_sample_docs_payload(
+            limit=limit,
+            sample_doc_json=sample_doc_json,
+            source_local_file=source_local_file,
+            source_index_name=source_index_name,
+        ),
+        ensure_ascii=False,
+    )
 
 
-@tool
-def submit_sample_doc_from_local_file(path_or_text: str) -> str:
-    """Load one sample record from a local file or directory and store it as sample doc.
+
+def submit_sample_doc_from_local_file(
+    path_or_text: str,
+    ingest_source_field_hints: str = "",
+) -> str:
+    """Load one sample record from a local file or directory.
 
     Args:
         path_or_text: Local file/directory path, or text containing a path like
             ~/Downloads/data.tsv.
+        ingest_source_field_hints: Optional comma-separated field names used to
+            rank candidate files when *path_or_text* is a directory.
 
     Returns:
-        str: Status message indicating success or reason for failure.
+        str: JSON string with ``sample_doc`` and ``source_local_file`` on
+            success, or a plain error message starting with ``Error:``.
     """
-    global _SAMPLE_DOC, _SAMPLE_SOURCE_LOCAL_FILE
-
     resolved_text = _extract_path_candidate(path_or_text)
     if not resolved_text:
         return "Error: could not detect a local file path."
@@ -634,13 +1046,17 @@ def submit_sample_doc_from_local_file(path_or_text: str) -> str:
     if not source_path.exists():
         return f"Error: local path not found: {source_path}"
 
+    hints = normalize_ingest_source_field_hints(ingest_source_field_hints or None)
+
     directory_note = ""
     if source_path.is_dir():
-        selected_file, file_count = _pick_directory_sample_file(source_path)
+        selected_file, file_count = _pick_directory_sample_file(
+            source_path, ingest_source_field_hints=hints,
+        )
         if selected_file is None:
             return (
                 f"Error: no supported data files found under directory '{source_path}'. "
-                "Supported extensions: .tsv, .tab, .csv, .jsonl, .ndjson, .json, .txt"
+                f"Supported extensions: {SUPPORTED_SAMPLE_FILE_FORMATS_COMMA}"
             )
         file_path = selected_file
         directory_note = (
@@ -658,40 +1074,185 @@ def submit_sample_doc_from_local_file(path_or_text: str) -> str:
     if parsed_doc is None:
         return f"Error: failed to parse sample record from '{file_path}'."
 
-    _SAMPLE_DOC = parsed_doc
-    _SAMPLE_SOURCE_LOCAL_FILE = str(file_path)
     field_preview = ", ".join(list(parsed_doc.keys())[:8])
     record_count, count_method = _estimate_record_count(file_path)
     if record_count is None:
         count_note = "record count could not be inferred from this file type."
     else:
-        count_prefix = "inferred records (excluding header)" if file_path.suffix.lower() in _TABULAR_EXTENSIONS else "inferred records"
+        extension = file_path.suffix.lower()
+        if extension in _TABULAR_EXTENSIONS:
+            count_prefix = "inferred records (excluding header)"
+        elif extension in _PARQUET_EXTENSIONS:
+            count_prefix = "records"
+        else:
+            count_prefix = "inferred records"
         method_suffix = "exact" if count_method == "exact" else "estimated"
         count_note = f"{count_prefix}: {record_count:,} ({method_suffix})."
     language_note = _infer_language_hint(parsed_doc)
     scope_note = (
-        "Clarification hint: confirm whether this source is the full corpus or only a sample for future files,"
-        " and whether additional languages are expected."
+        "Planning hint: treat this source as representative sample data and assume future ingestion growth; "
+        "infer language strategy from observed content unless the user specifies otherwise."
     )
-    return (
+    status = (
         f"Sample document loaded from '{file_path}'. "
         f"Detected fields: {field_preview}.{directory_note} "
         f"Data profile: {count_note} Language hint: {language_note} {scope_note}"
     )
+    return json.dumps(
+        {
+            "status": status,
+            "sample_doc": parsed_doc,
+            "source_local_file": str(file_path),
+        },
+        ensure_ascii=False,
+    )
 
 
-@tool
+
+def submit_sample_doc_from_localhost_index(index_or_text: str = "") -> str:
+    """Load one sample record from a localhost OpenSearch index.
+
+    Args:
+        index_or_text: Optional index name or free-form text that references an
+            index (for example, "use index movies").
+
+    Returns:
+        str: JSON string with ``sample_doc`` and ``source_index_name`` on
+            success, or a plain error message starting with ``Error:``.
+    """
+    index_name = _extract_index_candidate(index_or_text)
+
+    try:
+        opensearch_client, connect_error = _create_local_opensearch_client()
+    except Exception as e:
+        return f"Error: failed to initialize OpenSearch client: {e}"
+
+    if connect_error is not None or opensearch_client is None:
+        return connect_error or "Error: unable to connect to local OpenSearch."
+
+    ranked_indices: list[tuple[str, int]] | None = None
+    if not index_name:
+        ranked_indices, indices_error = _list_localhost_non_system_indices(opensearch_client)
+        if indices_error:
+            return indices_error
+        options = _format_index_options(ranked_indices)
+        return (
+            "Error: option 3 selected but no index name was provided.\n"
+            "Available non-system indices on localhost OpenSearch:\n"
+            f"{options}\n"
+            "Please choose one index name from this list and retry option 3."
+        )
+
+    try:
+        exists = opensearch_client.indices.exists(index=index_name)
+        if not bool(exists):
+            if ranked_indices is None:
+                ranked_indices, _ = _list_localhost_non_system_indices(opensearch_client)
+            if ranked_indices:
+                options = _format_index_options(ranked_indices)
+                return (
+                    f"Error: index '{index_name}' was not found on local OpenSearch.\n"
+                    "Available non-system indices on localhost OpenSearch:\n"
+                    f"{options}\n"
+                    "Please choose one index name from this list and retry option 3."
+                )
+            return f"Error: index '{index_name}' was not found on local OpenSearch."
+    except Exception as e:
+        return f"Error: failed to validate index '{index_name}': {e}"
+
+    exact_total_count: Optional[int] = None
+    try:
+        count_response = opensearch_client.count(
+            index=index_name,
+            body={"query": {"match_all": {}}},
+        )
+        raw_count = count_response.get("count") if isinstance(count_response, dict) else None
+        if isinstance(raw_count, bool):
+            exact_total_count = None
+        elif isinstance(raw_count, (int, float)):
+            exact_total_count = max(0, int(raw_count))
+        elif isinstance(raw_count, str):
+            cleaned = raw_count.replace(",", "").strip()
+            if cleaned:
+                exact_total_count = max(0, int(float(cleaned)))
+    except Exception:
+        # Keep sample loading robust even if count API is unavailable.
+        exact_total_count = None
+
+    try:
+        response = opensearch_client.search(
+            index=index_name,
+            body={"size": 1, "query": {"match_all": {}}, "track_total_hits": True},
+        )
+    except Exception as e:
+        return f"Error: failed to fetch sample document from index '{index_name}': {e}"
+
+    hits = (
+        response.get("hits", {}).get("hits", [])
+        if isinstance(response, dict)
+        else []
+    )
+    if not hits:
+        return f"Error: index '{index_name}' has no documents."
+
+    first_hit = hits[0] if isinstance(hits[0], dict) else {}
+    source = first_hit.get("_source")
+    if not isinstance(source, dict):
+        if source is None:
+            fallback = first_hit.get("fields")
+            source = (
+                fallback
+                if isinstance(fallback, dict)
+                else {"_id": first_hit.get("_id", "")}
+            )
+        else:
+            source = {"content": str(source)}
+
+    total_hits = (
+        response.get("hits", {}).get("total", None)
+        if isinstance(response, dict)
+        else None
+    )
+    if isinstance(total_hits, dict):
+        total_count = total_hits.get("value")
+    elif isinstance(total_hits, int):
+        total_count = total_hits
+    else:
+        total_count = None
+
+    field_preview = ", ".join(list(source.keys())[:8]) or "(none)"
+    if isinstance(exact_total_count, int):
+        total_note = f"exact documents: {exact_total_count:,} (via count API)"
+    elif isinstance(total_count, int):
+        total_note = f"inferred documents from search response: {total_count:,}"
+    else:
+        total_note = "document count unavailable from search response"
+
+    status = (
+        f"Sample document loaded from localhost OpenSearch index '{index_name}'. "
+        f"Detected fields: {field_preview}. Data profile: {total_note}."
+    )
+    payload: Dict[str, Any] = {
+        "status": status,
+        "sample_doc": source,
+        "source_index_name": index_name,
+        "source_localhost_index": True,
+    }
+    if isinstance(exact_total_count, int):
+        payload["source_index_doc_count"] = exact_total_count
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def submit_sample_doc_from_url(url_or_text: str) -> str:
-    """Download one sample record from a URL and store it as sample doc.
+    """Download one sample record from a URL.
 
     Args:
         url_or_text: HTTP/HTTPS URL, or text containing a URL.
 
     Returns:
-        str: Status message indicating success or reason for failure.
+        str: JSON string with ``sample_doc`` on success, or a plain error
+            message starting with ``Error:``.
     """
-    global _SAMPLE_DOC, _SAMPLE_SOURCE_LOCAL_FILE
-
     url = _extract_url_candidate(url_or_text)
     if not url:
         return "Error: could not detect an HTTP/HTTPS URL."
@@ -708,7 +1269,7 @@ def submit_sample_doc_from_url(url_or_text: str) -> str:
         with urlopen(request, timeout=20) as response:
             charset = response.headers.get_content_charset() or "utf-8"
             content_type = (response.headers.get("Content-Type", "") or "").lower()
-            raw = response.read(1024 * 1024)  # Read first 1MB, enough for header + sample rows.
+            raw = response.read(1024 * 1024)
     except Exception as e:
         return f"Error downloading URL '{url}': {e}"
 
@@ -719,7 +1280,17 @@ def submit_sample_doc_from_url(url_or_text: str) -> str:
     if not text.strip():
         return f"Error: downloaded content from '{url}' is blank."
 
-    # JSON payload.
+    def _success(parsed_doc: Dict[str, Any]) -> str:
+        field_preview = ", ".join(list(parsed_doc.keys())[:8])
+        status = (
+            f"Sample document loaded from URL '{url}'. "
+            f"Detected fields: {field_preview}"
+        )
+        return json.dumps(
+            {"status": status, "sample_doc": parsed_doc},
+            ensure_ascii=False,
+        )
+
     if "application/json" in content_type or parsed_url.path.lower().endswith(".json"):
         try:
             payload = json.loads(text)
@@ -730,34 +1301,20 @@ def submit_sample_doc_from_url(url_or_text: str) -> str:
                 parsed_doc = first if isinstance(first, dict) else {"content": str(first)}
             else:
                 parsed_doc = {"content": text.splitlines()[0]}
-            _SAMPLE_DOC = parsed_doc
-            _SAMPLE_SOURCE_LOCAL_FILE = None
-            field_preview = ", ".join(list(parsed_doc.keys())[:8])
-            return (
-                f"Sample document loaded from URL '{url}'. "
-                f"Detected fields: {field_preview}"
-            )
+            return _success(parsed_doc)
         except json.JSONDecodeError:
-            # Fall through to line-based parsing (some URLs return JSONL/text with incorrect headers).
             pass
 
     lines = [line.rstrip("\r\n") for line in text.splitlines() if line.strip()]
     if not lines:
         return f"Error: no usable lines found in downloaded content from '{url}'."
 
-    # JSONL support.
     first_line = lines[0].strip()
     if first_line.startswith("{"):
         try:
             parsed_doc = json.loads(first_line)
             if isinstance(parsed_doc, dict):
-                _SAMPLE_DOC = parsed_doc
-                _SAMPLE_SOURCE_LOCAL_FILE = None
-                field_preview = ", ".join(list(parsed_doc.keys())[:8])
-                return (
-                    f"Sample document loaded from URL '{url}'. "
-                    f"Detected fields: {field_preview}"
-                )
+                return _success(parsed_doc)
         except json.JSONDecodeError:
             pass
 
@@ -792,13 +1349,7 @@ def submit_sample_doc_from_url(url_or_text: str) -> str:
     else:
         parsed_doc = {"content": sample_line or header_line}
 
-    _SAMPLE_DOC = parsed_doc
-    _SAMPLE_SOURCE_LOCAL_FILE = None
-    field_preview = ", ".join(list(parsed_doc.keys())[:8])
-    return (
-        f"Sample document loaded from URL '{url}'. "
-        f"Detected fields: {field_preview}"
-    )
+    return _success(parsed_doc)
 
 def _strip_html(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text)
@@ -817,7 +1368,7 @@ def _decode_duckduckgo_redirect(url: str) -> str:
     return url
 
 
-@tool
+
 def search_opensearch_org(query: str, numberOfResults: int = 5) -> str:
     """Search from the OpenSearch documentation
 

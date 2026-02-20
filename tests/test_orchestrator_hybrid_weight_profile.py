@@ -1,0 +1,95 @@
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import orchestrator
+
+
+def test_build_hybrid_weight_profile_note_normalizes_unknown_to_balanced():
+    note = orchestrator._build_hybrid_weight_profile_note("unknown")
+    assert note == "Hybrid Weight Profile: balanced"
+
+
+def test_read_hybrid_weight_profile_choice_returns_semantic_for_mostly_semantic(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "read_single_choice_input",
+        lambda **kwargs: orchestrator._QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC,
+    )
+    profile = orchestrator._read_hybrid_weight_profile_choice()
+    assert profile == orchestrator._HYBRID_WEIGHT_OPTION_SEMANTIC
+
+
+def test_read_hybrid_weight_profile_choice_returns_lexical_for_mostly_exact(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "read_single_choice_input",
+        lambda **kwargs: orchestrator._QUERY_PATTERN_OPTION_MOSTLY_EXACT,
+    )
+    profile = orchestrator._read_hybrid_weight_profile_choice()
+    assert profile == orchestrator._HYBRID_WEIGHT_OPTION_LEXICAL
+
+
+def test_read_hybrid_weight_profile_choice_returns_balanced_for_balanced(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "read_single_choice_input",
+        lambda **kwargs: orchestrator._QUERY_PATTERN_OPTION_BALANCED,
+    )
+    profile = orchestrator._read_hybrid_weight_profile_choice()
+    assert profile == orchestrator._HYBRID_WEIGHT_OPTION_BALANCED
+
+
+def test_read_hybrid_weight_profile_choice_normalizes_unknown_to_balanced_default(monkeypatch):
+    monkeypatch.setattr(
+        orchestrator,
+        "read_single_choice_input",
+        lambda **kwargs: "unexpected-value",
+    )
+    profile = orchestrator._read_hybrid_weight_profile_choice()
+    assert profile == orchestrator._HYBRID_WEIGHT_OPTION_BALANCED
+
+
+def test_read_hybrid_weight_profile_choice_uses_field_context_and_three_options(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_read_single_choice_input(**kwargs):
+        captured.update(kwargs)
+        return orchestrator._QUERY_PATTERN_OPTION_MOSTLY_EXACT
+
+    monkeypatch.setattr(orchestrator, "read_single_choice_input", _fake_read_single_choice_input)
+
+    profile = orchestrator._read_hybrid_weight_profile_choice(
+        [" title ", "", "description", "TITLE"]
+    )
+
+    assert profile == orchestrator._HYBRID_WEIGHT_OPTION_LEXICAL
+    assert captured["title"] == "Semantic Search Query Pattern"
+    assert captured["default_value"] == orchestrator._QUERY_PATTERN_OPTION_BALANCED
+    options = captured["options"]
+    assert isinstance(options, list)
+    assert len(options) == 3
+    prompt = str(captured["prompt"])
+    assert prompt.startswith(
+        "From your sample data, fields like title, description look text-heavy."
+    )
+    assert (
+        "For your semantic search use cases, which best describes the typical user query style?"
+        in prompt
+    )
+
+
+def test_is_semantic_dominant_query_pattern_true_for_semantic():
+    assert orchestrator._is_semantic_dominant_query_pattern(
+        orchestrator._HYBRID_WEIGHT_OPTION_SEMANTIC
+    )
+
+
+def test_is_semantic_dominant_query_pattern_false_for_lexical_and_balanced():
+    assert not orchestrator._is_semantic_dominant_query_pattern(
+        orchestrator._HYBRID_WEIGHT_OPTION_LEXICAL
+    )
+    assert not orchestrator._is_semantic_dominant_query_pattern(
+        orchestrator._HYBRID_WEIGHT_OPTION_BALANCED
+    )

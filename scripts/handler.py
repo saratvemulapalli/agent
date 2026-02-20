@@ -1,19 +1,32 @@
+import os
 from typing import Optional
 
 class ThinkingCallbackHandler:
-    def __init__(self, thinking_color: str = "\033[90m", output_color: str = "\033[0m"):
+    def __init__(
+        self,
+        thinking_color: str = "\033[90m",
+        output_color: str = "\033[0m",
+        show_reasoning: Optional[bool] = None,
+    ):
         """
         Initialize the ThinkingCallbackHandler.
 
         Args:
             thinking_color: ANSI color code for reasoning/thinking text. Default is gray (\033[90m).
             output_color: ANSI color code for standard output text. Default is reset (\033[0m).
+            show_reasoning: Whether to print model reasoning text. If None, uses
+                SHOW_MODEL_REASONING env var ("0"/"false"/"no"/"off" to disable).
         """
         self.tool_count = 0
         self.previous_tool_use = None
         self.thinking_color = thinking_color
         self.output_color = output_color
         self.reset_color = "\033[0m"
+        if show_reasoning is None:
+            env_value = os.getenv("SHOW_MODEL_REASONING", "").strip().lower()
+            self.show_reasoning = env_value not in {"0", "false", "no", "off"}
+        else:
+            self.show_reasoning = bool(show_reasoning)
     
     def __call__(self, **kwargs):
         reasoning_text = kwargs.get("reasoningText")
@@ -22,7 +35,7 @@ class ThinkingCallbackHandler:
         current_tool_use = kwargs.get("current_tool_use", {})
         
         # 1. Handle Thinking/Reasoning
-        if reasoning_text:
+        if reasoning_text and self.show_reasoning:
             # Print reasoning in specified thinking color
             print(f"{self.thinking_color}{reasoning_text}{self.reset_color}", end="", flush=True)
         

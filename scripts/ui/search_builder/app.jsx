@@ -119,12 +119,16 @@ function App() {
         }
         const res = await fetch(`/api/autocomplete?${qs.toString()}`);
         const data = await res.json();
+        const resolvedField = String(data.field || "").trim();
         const options = Array.isArray(data.options)
           ? data.options
               .map((value) => String(value || "").trim())
               .filter((value) => value.length > 0)
           : [];
         if (!cancelled) {
+          if (resolvedField) {
+            setAutocompleteField((prev) => (prev === resolvedField ? prev : resolvedField));
+          }
           setAutocompleteOptions(options);
         }
       } catch (_err) {
@@ -140,9 +144,11 @@ function App() {
     };
   }, [indexName, query, capability, queryMode, autocompleteField]);
 
-  const runSearch = async (overrideQuery = null) => {
+  const runSearch = async (overrideQuery = null, options = {}) => {
     const effectiveQuery = (overrideQuery !== null ? overrideQuery : query).trim();
     const effectiveIndex = indexName.trim();
+    const searchIntent = String(options.intent || "").trim();
+    const fieldHint = String(options.field || "").trim();
     if (!effectiveIndex) {
       setError("Please enter an index name.");
       return;
@@ -155,6 +161,12 @@ function App() {
       qs.set("q", effectiveQuery);
       qs.set("size", "20");
       qs.set("debug", "1");
+      if (searchIntent) {
+        qs.set("intent", searchIntent);
+      }
+      if (fieldHint) {
+        qs.set("field", fieldHint);
+      }
       const res = await fetch(`/api/search?${qs.toString()}`);
       const data = await res.json();
       if (data.error) {
@@ -207,7 +219,10 @@ function App() {
     }
     setAutocompleteOptions([]);
     setQuery(text);
-    runSearch(text);
+    runSearch(text, {
+      intent: "autocomplete_selection",
+      field: autocompleteField,
+    });
   };
 
   return (

@@ -1,6 +1,5 @@
 from opensearchpy import OpenSearch
 
-from strands import tool
 from scripts.shared import normalize_text, value_shape, text_richness_score
 import json
 import os
@@ -14,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from scripts.tools import get_sample_docs_payload, set_ingest_source_field_hints
+from scripts.tools import get_sample_docs_payload, normalize_ingest_source_field_hints
 
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
@@ -28,6 +27,18 @@ SEARCH_UI_PORT = int(os.getenv("SEARCH_UI_PORT", "8765"))
 SEARCH_UI_STATIC_DIR = (
     Path(__file__).resolve().parent / "ui" / "search_builder"
 )
+_MODEL_MEMORY_SIGNAL_TOKENS = (
+    "memory constraints",
+    "memory constraint",
+    "native memory",
+    "out of memory",
+    "outofmemory",
+    "circuit_breaking_exception",
+    "ml_commons.native_memory_threshold",
+)
+SEMANTIC_QUERY_REWRITE_FLAG = "SEMANTIC_QUERY_REWRITE_USE_LLM"
+SEMANTIC_QUERY_REWRITE_MODEL_ID_ENV = "SEMANTIC_QUERY_REWRITE_MODEL_ID"
+DEFAULT_SEMANTIC_QUERY_REWRITE_MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
 _SEARCH_UI_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -38,13 +49,145 @@ _SEARCH_UI_CONTENT_TYPES = {
     ".svg": "image/svg+xml",
 }
 
-_VERIFICATION_DOC_TRACKER: dict[str, list[str]] = {}
-_LAST_VERIFICATION_INDEX: str = ""
-_SEARCH_UI_SERVER: ThreadingHTTPServer | None = None
-_SEARCH_UI_SERVER_THREAD: threading.Thread | None = None
-_SEARCH_UI_DEFAULT_INDEX: str = ""
-_SEARCH_UI_SERVER_LOCK = threading.Lock()
-_SEARCH_UI_SUGGESTION_META_BY_INDEX: dict[str, list[dict[str, object]]] = {}
+class _SearchUIRuntime:
+    def __init__(self) -> None:
+        self.server: ThreadingHTTPServer | None = None
+        self.thread: threading.Thread | None = None
+        self.default_index: str = ""
+        self.lock = threading.Lock()
+        self.suggestion_meta_by_index: dict[str, list[dict[str, object]]] = {}
+
+_search_ui = _SearchUIRuntime()
+
+
+def _parse_id_list(raw_ids: str) -> list[str]:
+    """Parse a comma-separated (["v-1","v-2"]) or JSON-array string (["v-1","v-2"]) into a list of strings."""
+    raw = (raw_ids or "").strip()
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            return [str(i) for i in json.loads(raw) if i]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _load_sample_docs(
+    limit: int,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> list[dict[str, object]]:
+    docs, _ = _load_sample_docs_with_note(
+        limit=limit,
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+    )
+    return docs
+
+
+def _fetch_docs_from_index_via_client(
+    source_index_name: str,
+    limit: int,
+) -> tuple[list[dict[str, object]], str]:
+    effective_limit = max(1, min(limit, 200))
+    target_source_index = str(source_index_name or "").strip().strip("'").strip('"')
+    if not target_source_index:
+        return [], ""
+
+    try:
+        opensearch_client = _create_client()
+    except Exception as e:
+        return [], f"failed to connect while loading source index '{target_source_index}': {e}"
+
+    try:
+        exists = opensearch_client.indices.exists(index=target_source_index)
+        if not bool(exists):
+            return [], f"source index '{target_source_index}' does not exist."
+    except Exception as e:
+        return [], f"failed to validate source index '{target_source_index}': {e}"
+
+    try:
+        response = opensearch_client.search(
+            index=target_source_index,
+            body={
+                "size": effective_limit,
+                "query": {"match_all": {}},
+                "sort": [{"_doc": "asc"}],
+                "track_total_hits": False,
+            },
+        )
+    except Exception as e:
+        return [], f"failed to fetch source sample documents from '{target_source_index}': {e}"
+
+    hits = (
+        response.get("hits", {}).get("hits", [])
+        if isinstance(response, dict)
+        else []
+    )
+    if not hits:
+        return [], f"source index '{target_source_index}' returned 0 hits for match_all."
+
+    docs: list[dict[str, object]] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        source = hit.get("_source")
+        if isinstance(source, dict):
+            docs.append(source)
+        elif isinstance(hit.get("fields"), dict):
+            docs.append(hit["fields"])
+        elif source is not None:
+            docs.append({"content": str(source)})
+    if not docs:
+        return [], f"source index '{target_source_index}' has no readable _source/fields payload."
+    return docs[:effective_limit], ""
+
+
+def _load_sample_docs_with_note(
+    limit: int,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> tuple[list[dict[str, object]], str]:
+    """Load sample docs with backward-compatible source_index_name support and diagnostics."""
+    diagnostics: list[str] = []
+
+    try:
+        docs = get_sample_docs_payload(
+            limit=limit,
+            sample_doc_json=sample_doc_json,
+            source_local_file=source_local_file,
+            source_index_name=source_index_name,
+        )
+    except TypeError as e:
+        # Some tests monkeypatch get_sample_docs_payload with the legacy 3-arg signature.
+        if "source_index_name" not in str(e):
+            raise
+        docs = get_sample_docs_payload(limit, sample_doc_json, source_local_file)
+
+    parsed_docs = [doc for doc in docs if isinstance(doc, dict)]
+    if parsed_docs:
+        return parsed_docs, ""
+
+    normalized_source_index = (
+        str(source_index_name or "").strip().strip("'").strip('"')
+    )
+    if normalized_source_index:
+        fallback_docs, fallback_note = _fetch_docs_from_index_via_client(
+            source_index_name=normalized_source_index,
+            limit=limit,
+        )
+        if fallback_docs:
+            return fallback_docs, ""
+        if fallback_note:
+            diagnostics.append(fallback_note)
+
+    if not diagnostics:
+        return [], ""
+    return [], "; ".join(diagnostics)
 
 
 def _build_client(use_ssl: bool) -> OpenSearch:
@@ -118,6 +261,21 @@ def _docker_start_hint() -> str:
             "Start Docker service (for example: 'sudo systemctl start docker')."
         )
     return "Start the Docker daemon/service and retry."
+
+
+def _looks_like_model_memory_pressure(error: object) -> bool:
+    lowered = normalize_text(error).lower()
+    return any(token in lowered for token in _MODEL_MEMORY_SIGNAL_TOKENS)
+
+
+def _format_model_failure_message(stage: str, error: object) -> str:
+    message = f"Model {stage} failed: {error}"
+    if _looks_like_model_memory_pressure(error):
+        return (
+            f"{message} OpenSearch appears memory constrained. "
+            "Please reconnect Docker (restart Docker Desktop/service) and retry."
+        )
+    return message
 
 
 def _start_local_opensearch_container() -> None:
@@ -591,6 +749,105 @@ def _resolve_field_spec_for_doc_key(
 
     return "", {}
 
+
+_INFERRED_NUMERIC_TYPES = {"long", "double"}
+
+
+def _merge_inferred_field_types(existing_type: str, incoming_type: str) -> str:
+    existing = _normalize_text(existing_type).lower()
+    incoming = _normalize_text(incoming_type).lower()
+    if not incoming:
+        return existing
+    if not existing:
+        return incoming
+    if existing == incoming:
+        return existing
+    if existing in _INFERRED_NUMERIC_TYPES and incoming in _INFERRED_NUMERIC_TYPES:
+        return "double" if "double" in {existing, incoming} else "long"
+    if "text" in {existing, incoming}:
+        return "text"
+    if "keyword" in {existing, incoming}:
+        return "keyword"
+    if existing == incoming == "date":
+        return "date"
+    if existing == incoming == "boolean":
+        return "boolean"
+    return "keyword"
+
+
+def _infer_field_type_from_value(value: object, shape: dict[str, object] | None = None) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "long"
+    if isinstance(value, float):
+        return "double"
+
+    normalized = _normalize_text(value)
+    if not normalized:
+        return ""
+
+    value_shape_info = shape if isinstance(shape, dict) else _value_shape(normalized)
+    if bool(value_shape_info.get("looks_numeric", False)):
+        if re.fullmatch(r"[+-]?\d+", normalized):
+            return "long"
+        return "double"
+    if bool(value_shape_info.get("looks_date", False)):
+        return "date"
+
+    token_count = int(value_shape_info.get("token_count", 0))
+    alpha_ratio = float(value_shape_info.get("alpha_ratio", 0.0))
+    if (
+        token_count >= 2
+        and alpha_ratio >= 0.35
+        and 8 <= len(normalized) <= 220
+        and not _looks_like_url_noise(normalized)
+    ):
+        return "text"
+    return "keyword"
+
+
+def _infer_field_specs_from_sample_docs(
+    docs: list[dict[str, object]],
+) -> dict[str, dict[str, str]]:
+    field_specs: dict[str, dict[str, str]] = {}
+    if not isinstance(docs, list):
+        return field_specs
+
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        for raw_key, raw_value in doc.items():
+            key = _normalize_text(raw_key)
+            if not key or raw_value is None or isinstance(raw_value, (dict, list)):
+                continue
+            shape = _value_shape(_normalize_text(raw_value))
+            inferred_type = _infer_field_type_from_value(raw_value, shape)
+            if not inferred_type:
+                continue
+
+            current_type = str(field_specs.get(key, {}).get("type", "")).strip().lower()
+            merged_type = _merge_inferred_field_types(current_type, inferred_type)
+            if not merged_type:
+                continue
+            field_specs[key] = {
+                "type": merged_type,
+                "normalizer": "",
+            }
+
+    # For inferred text fields, assume a keyword multi-field can be used for exact match demos.
+    for field_name, spec in list(field_specs.items()):
+        if spec.get("type") != "text":
+            continue
+        keyword_field = f"{field_name}.keyword"
+        if keyword_field not in field_specs:
+            field_specs[keyword_field] = {
+                "type": "keyword",
+                "normalizer": "",
+            }
+
+    return field_specs
+
 def _value_shape(text: str) -> dict[str, object]:
     """Compute structural characteristics of a text value.
 
@@ -656,7 +913,8 @@ def _extract_doc_features(
           - ``"type"`` (str): The mapping type.
 
         - ``"anchor_tokens"`` (list[dict]): Individual tokens (>= 2 chars,
-          non-digit) extracted from all scalar values, with source field info.
+          non-digit) extracted only from ``text``/``keyword`` scalar fields,
+          with source field info.
           Each entry has:
 
           - ``"token"`` (str): The token text.
@@ -723,11 +981,14 @@ def _extract_doc_features(
 
         resolved_field, resolved_spec = _resolve_field_spec_for_doc_key(str(key), field_specs)
         shape = _value_shape(compact)
+        resolved_type = str(resolved_spec.get("type", "")).strip().lower()
+        if not resolved_type:
+            resolved_type = _infer_field_type_from_value(value, shape)
         scalar_items.append(
             {
                 "key": str(key),
                 "field": resolved_field,
-                "type": resolved_spec.get("type", ""),
+                "type": resolved_type,
                 "normalizer": resolved_spec.get("normalizer", ""),
                 "shape": shape,
             }
@@ -785,7 +1046,12 @@ def _extract_doc_features(
                     }
                 )
 
-        if token_count >= 2 and alpha_ratio >= 0.35 and 8 <= len(text_value) <= 220:
+        if (
+            token_count >= 2
+            and alpha_ratio >= 0.35
+            and 8 <= len(text_value) <= 220
+            and not _looks_like_url_noise(text_value)
+        ):
             semantic_candidates.append(
                 {
                     "text": text_value,
@@ -807,11 +1073,12 @@ def _extract_doc_features(
                 }
             )
 
-        for token in shape["tokens"]:
-            if token.isdigit():
-                continue
-            if len(token) >= 2:
-                anchor_tokens.append({"token": token, "field": field or key})
+        if field_type in {"text", "keyword", "constant_keyword"}:
+            for token in shape["tokens"]:
+                if token.isdigit():
+                    continue
+                if len(token) >= 2:
+                    anchor_tokens.append({"token": token, "field": field or key})
 
     if not exact_candidates:
         for candidate in phrase_candidates:
@@ -829,7 +1096,7 @@ def _extract_doc_features(
         for item in scalar_items:
             shape = item["shape"]
             text_value = str(shape["text"])
-            if len(text_value) >= 4:
+            if len(text_value) >= 4 and not _looks_like_url_noise(text_value):
                 semantic_candidates.append(
                     {
                         "text": text_value,
@@ -897,12 +1164,13 @@ def _score_doc_for_capability(features: dict[str, object], capability_id: str) -
         return float(len(structured_candidates) * 20)
 
     if capability_id == "combined":
-        if not semantic_candidates or not structured_candidates:
+        if not structured_candidates:
             return 0.0
+        score = 80.0 + float(len(structured_candidates) * 12)
         best_text = _best_semantic_text_from_candidates(semantic_candidates)
-        if not best_text:
-            return 0.0
-        return 80.0 + float(len(structured_candidates)) + min(len(best_text), 200) / 20.0
+        if best_text:
+            score += min(len(best_text), 200) / 40.0
+        return score
 
     if capability_id == "autocomplete":
         longest = max((len(_anchor_token_text(token)) for token in anchor_tokens), default=0)
@@ -913,6 +1181,45 @@ def _score_doc_for_capability(features: dict[str, object], capability_id: str) -
         return float(40 + longest) if longest >= 5 else 0.0
 
     return 0.0
+
+
+def _capability_has_sample_support(
+    features_list: list[dict[str, object]],
+    capability_id: str,
+) -> bool:
+    normalized_id = _normalize_text(capability_id).lower()
+    if not normalized_id:
+        return False
+
+    for features in features_list:
+        if _score_doc_for_capability(features, normalized_id) > 0:
+            return True
+    return False
+
+
+def _split_capabilities_by_sample_support(
+    features_list: list[dict[str, object]],
+    capabilities: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, str]]]:
+    """Partition capabilities into applicable vs unsupported for sampled docs."""
+    applicable: list[dict[str, object]] = []
+    skipped: list[dict[str, str]] = []
+
+    for capability in capabilities:
+        capability_id = _normalize_text(capability.get("id", "")).lower()
+        if not capability_id:
+            continue
+        if _capability_has_sample_support(features_list, capability_id):
+            applicable.append(capability)
+            continue
+        skipped.append(
+            {
+                "id": capability_id,
+                "reason": "No compatible fields/values were found in sampled documents.",
+            }
+        )
+
+    return applicable, skipped
 
 
 def _select_docs_by_capability(
@@ -1012,6 +1319,139 @@ def _mutate_token_for_typo(token: str) -> str:
     return token[:pivot] + token[pivot + 1 :]
 
 
+def _structured_candidate_parts(candidate: object) -> tuple[str, str]:
+    if not isinstance(candidate, dict):
+        return "", ""
+    field_name = _normalize_text(str(candidate.get("field", "")).split(".")[-1])
+    value_text = _normalize_text(str(candidate.get("value", "")))
+    if not field_name or not value_text:
+        return "", ""
+    return field_name, value_text
+
+
+def _select_structured_source_candidate(
+    structured_candidates: list[dict[str, object]],
+) -> dict[str, object]:
+    for candidate in structured_candidates:
+        field_name, value_text = _structured_candidate_parts(candidate)
+        if field_name and value_text:
+            return dict(candidate)
+    return {}
+
+
+def _format_structured_value_for_query(value_text: str) -> str:
+    normalized = _normalize_text(value_text)
+    if not normalized:
+        return ""
+    safe = normalized.replace('"', "'")
+    needs_quotes = (
+        bool(re.search(r"\s", safe))
+        or ":" in safe
+        or " and " in safe.lower()
+        or " or " in safe.lower()
+    )
+    return f"\"{safe}\"" if needs_quotes else safe
+
+
+def _unique_structured_pairs(
+    structured_candidates: list[dict[str, object]],
+) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for candidate in structured_candidates:
+        field_name, value_text = _structured_candidate_parts(candidate)
+        if not field_name or not value_text:
+            continue
+        key = (field_name.lower(), value_text.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append((field_name, value_text))
+    return pairs
+
+
+def _select_text_pair_for_combined_query(
+    phrase_candidates: list[dict[str, object]],
+    exact_candidates: list[dict[str, object]],
+    excluded_fields: set[str] | None = None,
+) -> tuple[str, str]:
+    blocked = set(excluded_fields or set())
+
+    def _candidate_pairs(candidates: list[dict[str, object]]) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        for candidate in candidates:
+            field_name = _normalize_text(str(candidate.get("field", "")).split(".")[-1])
+            value_text = _normalize_text(candidate.get("text", ""))
+            if not field_name or not value_text:
+                continue
+            field_key = field_name.lower()
+            if field_key in blocked:
+                continue
+            pairs.append((field_name, _trim_words(value_text, 8)))
+        return pairs
+
+    phrase_pairs = _candidate_pairs(
+        [item for item in phrase_candidates if isinstance(item, dict)]
+    )
+    if phrase_pairs:
+        return phrase_pairs[0]
+
+    exact_phrase_pairs = _candidate_pairs(
+        [
+            item
+            for item in exact_candidates
+            if isinstance(item, dict)
+            and _normalize_text(item.get("query_mode", "")).lower() == "match_phrase"
+        ]
+    )
+    if exact_phrase_pairs:
+        return exact_phrase_pairs[0]
+
+    return "", ""
+
+
+def _compose_combined_structured_example(structured_candidates: list[dict[str, object]]) -> str:
+    pairs = _unique_structured_pairs(structured_candidates)
+    if len(pairs) < 2:
+        return ""
+    first_field, first_value = pairs[0]
+    second_field, second_value = pairs[1]
+    return (
+        f"{first_field}: {_format_structured_value_for_query(first_value)} "
+        f"and {second_field}: {_format_structured_value_for_query(second_value)}"
+    )
+
+
+def _compose_combined_text_structured_example(
+    phrase_candidates: list[dict[str, object]],
+    exact_candidates: list[dict[str, object]],
+    structured_candidates: list[dict[str, object]],
+) -> str:
+    pairs = _unique_structured_pairs(structured_candidates)
+    if not pairs:
+        return ""
+
+    structured_field, structured_value = pairs[0]
+    text_field, text_value = _select_text_pair_for_combined_query(
+        phrase_candidates=phrase_candidates,
+        exact_candidates=exact_candidates,
+        excluded_fields={structured_field.lower()},
+    )
+    if not text_field or not text_value:
+        text_field, text_value = _select_text_pair_for_combined_query(
+            phrase_candidates=phrase_candidates,
+            exact_candidates=exact_candidates,
+            excluded_fields=set(),
+        )
+    if not text_field or not text_value:
+        return ""
+
+    return (
+        f"{text_field}: {_format_structured_value_for_query(text_value)} "
+        f"and {structured_field}: {_format_structured_value_for_query(structured_value)}"
+    )
+
+
 _SEMANTIC_REWRITE_STOPWORDS = {
     "a",
     "an",
@@ -1034,7 +1474,146 @@ _SEMANTIC_REWRITE_STOPWORDS = {
     "this",
     "to",
     "with",
+    "may",
+    "refer",
+    "refers",
+    "also",
+    "other",
+    "uses",
+    "use",
+    "see",
+    "list",
+    "including",
+    "include",
+    "various",
+    "named",
+    "name",
+    "names",
 }
+_SEMANTIC_REWRITE_URL_TOKENS = {
+    "http",
+    "https",
+    "www",
+    "com",
+    "org",
+    "net",
+    "edu",
+    "gov",
+    "wiki",
+    "wikipedia",
+}
+
+
+def _is_truthy_flag(raw_value: str) -> bool:
+    return str(raw_value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def _semantic_query_rewrite_llm_enabled() -> bool:
+    explicit = os.getenv(SEMANTIC_QUERY_REWRITE_FLAG, "").strip()
+    if explicit:
+        return _is_truthy_flag(explicit)
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return False
+    return bool(os.getenv("AWS_ACCESS_KEY_ID") and os.getenv("AWS_SECRET_ACCESS_KEY"))
+
+
+def _looks_like_url_noise(text: str) -> bool:
+    normalized = _normalize_text(text).lower()
+    if not normalized:
+        return False
+    if "http://" in normalized or "https://" in normalized or "www." in normalized:
+        return True
+    if normalized.count("/") >= 3:
+        return True
+    tokens = re.findall(r"[a-z0-9_]+", normalized)
+    if not tokens:
+        return False
+    domain_token_hits = sum(1 for token in tokens if token in _SEMANTIC_REWRITE_URL_TOKENS)
+    return domain_token_hits >= 2
+
+
+def _sanitize_semantic_rewrite_output(text: str) -> str:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return ""
+    first_line = normalized.splitlines()[0].strip()
+    first_line = re.sub(r"^[-*]\s+", "", first_line)
+    first_line = re.sub(r"^(?:semantic\s+query|query)\s*:\s*", "", first_line, flags=re.IGNORECASE)
+    first_line = first_line.strip().strip("`").strip("'").strip('"').strip()
+    if not first_line:
+        return ""
+    return _normalize_text(first_line)[:120]
+
+
+_DISAMBIGUATION_LEAD_PATTERN = re.compile(
+    r"^\s*([A-Za-z0-9][A-Za-z0-9 .'\-]{0,80})\s+may\s+refer\s+to\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_disambiguation_subject(text: str) -> str:
+    normalized = _normalize_text(text)
+    if not normalized:
+        return ""
+    match = _DISAMBIGUATION_LEAD_PATTERN.match(normalized)
+    if not match:
+        return ""
+    subject = _normalize_text(match.group(1))
+    if not subject:
+        return ""
+    words = subject.split()
+    if len(words) > 5:
+        return ""
+    return " ".join(words)
+
+
+def _rewrite_semantic_example_with_llm(text: str) -> str:
+    if not _semantic_query_rewrite_llm_enabled():
+        return ""
+
+    normalized = _normalize_text(text)
+    if len(normalized) < 8:
+        return ""
+
+    model_id = (
+        os.getenv(SEMANTIC_QUERY_REWRITE_MODEL_ID_ENV, DEFAULT_SEMANTIC_QUERY_REWRITE_MODEL_ID).strip()
+        or DEFAULT_SEMANTIC_QUERY_REWRITE_MODEL_ID
+    )
+    source_excerpt = normalized[:1800]
+
+    try:
+        from strands import Agent
+        from strands.models import BedrockModel
+
+        model = BedrockModel(
+            model_id=model_id,
+            max_tokens=120,
+        )
+        agent = Agent(
+            model=model,
+            system_prompt=(
+                "You rewrite document snippets into one concise semantic search query.\n"
+                "Rules:\n"
+                "- Output only one single-line query.\n"
+                "- Keep it natural and specific (about 4-12 words).\n"
+                "- Do not include URLs, domain fragments, or boilerplate words.\n"
+                "- Do not add explanations, labels, bullets, or quotes.\n"
+                "- Prefer core topic/entities and user intent."
+            ),
+        )
+        response = agent(
+            "Rewrite this snippet into one semantic search query only:\n"
+            f"{source_excerpt}"
+        )
+    except Exception:
+        return ""
+
+    rewritten = _sanitize_semantic_rewrite_output(str(response))
+    if len(rewritten.split()) < 2:
+        return ""
+    if _looks_like_url_noise(rewritten):
+        return ""
+    return rewritten
 
 
 def _select_semantic_source_candidate(
@@ -1061,6 +1640,8 @@ def _select_semantic_source_candidate(
             score -= 15.0
         if bool(shape.get("looks_numeric", False)) or bool(shape.get("looks_date", False)):
             score -= 20.0
+        if _looks_like_url_noise(text):
+            score -= 60.0
 
         if score > best_score:
             best_score = score
@@ -1074,23 +1655,6 @@ def _best_semantic_text_from_candidates(semantic_candidates: list[dict[str, obje
     return _normalize_text(selected.get("text", ""))
 
 
-def _is_english_like(text: str) -> bool:
-    normalized = _normalize_text(text)
-    if not normalized:
-        return False
-
-    shape = _value_shape(normalized)
-    alpha_ratio = float(shape.get("alpha_ratio", 0.0))
-    if alpha_ratio < 0.55:
-        return False
-
-    alpha_chars = [ch for ch in normalized if ch.isalpha()]
-    if not alpha_chars:
-        return False
-    ascii_alpha_ratio = sum(1 for ch in alpha_chars if ch.isascii()) / len(alpha_chars)
-    return ascii_alpha_ratio >= 0.8
-
-
 def _extract_concept_tokens(text: str) -> list[str]:
     shape = _value_shape(_normalize_text(text))
     concepts: list[str] = []
@@ -1098,7 +1662,13 @@ def _extract_concept_tokens(text: str) -> list[str]:
 
     for raw_token in shape.get("tokens", []):
         token = str(raw_token).strip().lower()
+        token = re.sub(r"^\d+", "", token)
+        token = re.sub(r"\d+$", "", token)
         if not token or len(token) < 3 or token.isdigit():
+            continue
+        if any(ch.isdigit() for ch in token):
+            continue
+        if token in _SEMANTIC_REWRITE_URL_TOKENS:
             continue
         if token in _SEMANTIC_REWRITE_STOPWORDS or token in seen:
             continue
@@ -1109,69 +1679,22 @@ def _extract_concept_tokens(text: str) -> list[str]:
     return concepts
 
 
-def _expand_tokens_with_wordnet(tokens: list[str]) -> list[str]:
-    if not tokens:
-        return []
-
-    try:
-        from nltk.corpus import wordnet as wn
-    except Exception:
-        return []
-
-    expansions: list[str] = []
-    seen: set[str] = {str(token).lower() for token in tokens}
-    noun_pos = getattr(wn, "NOUN", None)
-    verb_pos = getattr(wn, "VERB", None)
-
-    def _append_candidate(raw_value: str) -> None:
-        value = _normalize_text(raw_value.replace("_", " ")).lower()
-        if not value or value in seen:
-            return
-        seen.add(value)
-        expansions.append(value)
-
-    try:
-        for token in tokens[:3]:
-            synsets = []
-            if noun_pos is not None:
-                synsets.extend(wn.synsets(token, pos=noun_pos))
-            if verb_pos is not None:
-                synsets.extend(wn.synsets(token, pos=verb_pos))
-            if not synsets:
-                continue
-
-            first_synset = synsets[0]
-            lemmas = first_synset.lemmas()
-            if lemmas:
-                _append_candidate(lemmas[0].name())
-
-            hypernyms = first_synset.hypernyms()
-            if hypernyms:
-                hyper_lemmas = hypernyms[0].lemmas()
-                if hyper_lemmas:
-                    _append_candidate(hyper_lemmas[0].name())
-
-            if len(expansions) >= 4:
-                break
-    except LookupError:
-        return []
-    except Exception:
-        return []
-
-    return expansions[:4]
-
-
 def _compose_semantic_query(
     original_text: str,
     concept_tokens: list[str],
-    expansions: list[str],
 ) -> tuple[str, bool]:
     base_tokens = concept_tokens[:6]
     if not base_tokens:
         fallback_tokens = [
             str(token).lower()
             for token in _value_shape(original_text).get("tokens", [])
-            if len(str(token)) >= 3 and not str(token).isdigit()
+            if (
+                len(str(token)) >= 3
+                and not str(token).isdigit()
+                and str(token).lower() not in _SEMANTIC_REWRITE_STOPWORDS
+                and str(token).lower() not in _SEMANTIC_REWRITE_URL_TOKENS
+                and not any(ch.isdigit() for ch in str(token))
+            )
         ]
         base_tokens = fallback_tokens[:6]
 
@@ -1179,14 +1702,10 @@ def _compose_semantic_query(
     if not base:
         return "", False
 
-    if expansions:
-        related = ", ".join(expansions[:2])
-        return _normalize_text(f"about {base} and related ideas like {related}"), True
-
     base_shape = _value_shape(base)
     token_count = int(base_shape.get("token_count", 0))
     if token_count >= 4 and len(base) >= 12:
-        return _normalize_text(f"about {base}"), True
+        return base, True
     return "", False
 
 
@@ -1195,17 +1714,25 @@ def _rewrite_semantic_example(text: str) -> str:
     if not normalized:
         return ""
 
-    concept_tokens = _extract_concept_tokens(normalized)
-    expansions: list[str] = []
-    if _is_english_like(normalized):
-        expansions = _expand_tokens_with_wordnet(concept_tokens)
+    llm_rewritten = _rewrite_semantic_example_with_llm(normalized)
+    if llm_rewritten:
+        return llm_rewritten[:120]
 
+    disambiguation_subject = _extract_disambiguation_subject(normalized)
+    if disambiguation_subject:
+        return _normalize_text(f"{disambiguation_subject} disambiguation")[:120]
+
+    concept_tokens = _extract_concept_tokens(normalized)
     rewritten, confidence_high = _compose_semantic_query(
         original_text=normalized,
         concept_tokens=concept_tokens,
-        expansions=expansions,
     )
     if not confidence_high:
+        if _looks_like_url_noise(normalized):
+            fallback_tokens = _extract_concept_tokens(normalized)
+            fallback_text = _normalize_text(" ".join(fallback_tokens[:6]))
+            if fallback_text:
+                return fallback_text[:120]
         return normalized[:120]
 
     final_text = _normalize_text(rewritten)
@@ -1217,11 +1744,14 @@ def _infer_capability_examples_from_features(
     features: dict[str, object],
 ) -> list[str]:
     exact_candidates = features.get("exact_candidates", [])
+    phrase_candidates = features.get("phrase_candidates", [])
     semantic_candidates = features.get("semantic_candidates", [])
     structured_candidates = features.get("structured_candidates", [])
     anchor_tokens = features.get("anchor_tokens", [])
     if not isinstance(exact_candidates, list):
         exact_candidates = []
+    if not isinstance(phrase_candidates, list):
+        phrase_candidates = []
     if not isinstance(semantic_candidates, list):
         semantic_candidates = []
     if not isinstance(structured_candidates, list):
@@ -1253,30 +1783,30 @@ def _infer_capability_examples_from_features(
         if not source_text:
             return []
         rewritten = _rewrite_semantic_example(source_text)
-        return [rewritten] if rewritten else [source_text]
+        if rewritten:
+            return [rewritten]
+        if _looks_like_url_noise(source_text):
+            return []
+        return [source_text]
 
     if capability_id == "structured":
-        structured = next(iter(structured_candidates), None)
-        if not isinstance(structured, dict):
+        structured = _select_structured_source_candidate(structured_candidates)
+        if not structured:
             return []
-        field_name = str(structured.get("field", "")).split(".")[-1]
-        value_text = _normalize_text(str(structured.get("value", "")))
+        field_name, value_text = _structured_candidate_parts(structured)
         if not field_name or not value_text:
             return []
         return [f"{field_name}: {value_text}"]
 
     if capability_id == "combined":
-        selected = _select_semantic_source_candidate(semantic_candidates)
-        source_text = _normalize_text(selected.get("text", ""))
-        semantic_text = _rewrite_semantic_example(source_text) if source_text else ""
-        structured = next(iter(structured_candidates), None)
-        if not semantic_text or not isinstance(structured, dict):
-            return []
-        field_name = str(structured.get("field", "")).split(".")[-1]
-        value_text = _normalize_text(str(structured.get("value", "")))
-        if not field_name or not value_text:
-            return []
-        return [f"{semantic_text} with {field_name} {value_text}"]
+        combined_text = _compose_combined_structured_example(structured_candidates)
+        if not combined_text:
+            combined_text = _compose_combined_text_structured_example(
+                phrase_candidates=phrase_candidates,
+                exact_candidates=exact_candidates,
+                structured_candidates=structured_candidates,
+            )
+        return [combined_text] if combined_text else []
 
     if capability_id == "autocomplete":
         token_text, _ = _first_anchor_token(anchor_tokens, min_len=3)
@@ -1399,11 +1929,10 @@ def _build_suggestion_entry(capability: dict[str, object], features: dict[str, o
         query_mode = "hybrid"
         value = ""
     elif capability_id == "structured":
-        structured = next(iter(structured_candidates), None)
-        if structured is None:
+        structured = _select_structured_source_candidate(structured_candidates)
+        if not structured:
             return None
-        field_name = str(structured.get("field", "")).split(".")[-1]
-        value_text = _normalize_text(str(structured.get("value", "")))
+        field_name, value_text = _structured_candidate_parts(structured)
         if not field_name or not value_text:
             return None
         suggestion_text = f"{field_name}: {value_text}"
@@ -1412,20 +1941,24 @@ def _build_suggestion_entry(capability: dict[str, object], features: dict[str, o
         value = value_text
     elif capability_id == "combined":
         planner_example = _first_capability_example()
-        structured = next(iter(structured_candidates), None)
-        if structured is None:
+        structured = _select_structured_source_candidate(structured_candidates)
+        if not structured:
             return None
-        field_name = str(structured.get("field", "")).split(".")[-1]
-        value_text = _normalize_text(str(structured.get("value", "")))
+        field_name, value_text = _structured_candidate_parts(structured)
         if not field_name or not value_text:
             return None
-        if planner_example and " with " in planner_example.lower():
+        if planner_example:
             suggestion_text = planner_example
         else:
-            semantic_text = planner_example or _best_semantic_text_from_candidates(semantic_candidates)
-            if not semantic_text:
-                return None
-            suggestion_text = f"{_trim_words(semantic_text, 6)} with {field_name} {value_text}"
+            suggestion_text = _compose_combined_structured_example(structured_candidates)
+            if not suggestion_text:
+                suggestion_text = _compose_combined_text_structured_example(
+                    phrase_candidates=phrase_candidates,
+                    exact_candidates=exact_candidates,
+                    structured_candidates=structured_candidates,
+                )
+                if not suggestion_text:
+                    return None
         field = _normalize_text(structured.get("field", ""))
         query_mode = "hybrid_structured"
         value = value_text
@@ -1486,75 +2019,90 @@ def _find_suggestion_meta(index_name: str, query_text: str) -> dict[str, object]
     query_key = _normalized_query_key(query_text)
     if not query_key:
         return None
-    for entry in _SEARCH_UI_SUGGESTION_META_BY_INDEX.get(index_name, []):
+    for entry in _search_ui.suggestion_meta_by_index.get(index_name, []):
         if _normalized_query_key(entry.get("text", "")) == query_key:
             return entry
     return None
 
 
-@tool
-def apply_capability_driven_verification(
+def _evaluate_capability_driven_selection(
     worker_output: str,
-    index_name: str = "",
     count: int = 10,
-    id_prefix: str = "verification",
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+    field_specs: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, object]:
-    global _LAST_VERIFICATION_INDEX
-
     effective_count = max(1, min(count, 100))
-    target_index = (index_name or "").strip()
     result: dict[str, object] = {
-        "applied": False,
-        "index_name": target_index,
         "capabilities": [],
-        "indexed_count": 0,
-        "doc_ids": [],
+        "capability_items": [],
+        "applicable_capabilities": [],
+        "applicable_capability_items": [],
+        "skipped_capabilities": [],
+        "suggestion_meta": [],
+        "selected_indexes_for_indexing": [],
+        "features_list": [],
         "notes": [],
+        "used_inferred_field_specs": False,
     }
 
-    if not target_index:
-        result["notes"] = [
-            "index_name is required for apply_capability_driven_verification; "
-            "fallback index resolution is disabled."
-        ]
-        return result
-
     capabilities = _extract_search_capabilities(worker_output)
-    result["capabilities"] = [str(item.get("id", "")) for item in capabilities if item.get("id")]
+    result["capability_items"] = capabilities
+    result["capabilities"] = [
+        str(item.get("id", "")).strip().lower()
+        for item in capabilities
+        if str(item.get("id", "")).strip()
+    ]
     if not capabilities:
-        _SEARCH_UI_SUGGESTION_META_BY_INDEX.pop(target_index, None)
         result["notes"] = ["worker output has no Search Capabilities section"]
         return result
 
     candidate_limit = max(60, min(200, effective_count * 20))
-    candidate_docs = [
-        doc
-        for doc in get_sample_docs_payload(candidate_limit)
-        if isinstance(doc, dict)
-    ]
+    candidate_docs, sample_note = _load_sample_docs_with_note(
+        limit=candidate_limit,
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+    )
     if not candidate_docs:
-        result["notes"] = ["no sample documents available for capability-driven selection"]
+        notes = ["no sample documents available for capability-driven selection"]
+        if sample_note:
+            notes.append(sample_note)
+        result["notes"] = notes
         return result
 
-    try:
-        opensearch_client = _create_client()
-    except Exception as e:
-        result["notes"] = [f"failed to connect to OpenSearch: {e}"]
-        return result
+    resolved_field_specs = dict(field_specs) if isinstance(field_specs, dict) else {}
+    notes: list[str] = []
+    if not resolved_field_specs:
+        resolved_field_specs = _infer_field_specs_from_sample_docs(candidate_docs)
+        if resolved_field_specs:
+            result["used_inferred_field_specs"] = True
+            notes.append(
+                "index mapping unavailable; inferred field specs from sampled documents for capability precheck."
+            )
 
-    field_specs = _extract_index_field_specs(opensearch_client, target_index)
-    existing_field_types = {
-        field_name: str(spec.get("type", "")).strip().lower()
-        for field_name, spec in field_specs.items()
-        if isinstance(spec, dict)
-    }
+    features_list = [_extract_doc_features(doc, resolved_field_specs) for doc in candidate_docs]
+    applicable_capabilities, skipped_capabilities = _split_capabilities_by_sample_support(
+        features_list=features_list,
+        capabilities=capabilities,
+    )
+    result["features_list"] = features_list
+    result["applicable_capability_items"] = applicable_capabilities
+    result["applicable_capabilities"] = [
+        str(item.get("id", "")).strip().lower()
+        for item in applicable_capabilities
+        if str(item.get("id", "")).strip()
+    ]
+    result["skipped_capabilities"] = skipped_capabilities
 
-    features_list = [_extract_doc_features(doc, field_specs) for doc in candidate_docs]
-    selected_by_capability, notes = _select_docs_by_capability(features_list, capabilities)
+    selected_by_capability, selection_notes = _select_docs_by_capability(
+        features_list,
+        applicable_capabilities,
+    )
 
-    # Infer capability examples from selected candidate docs instead of relying on
-    # planner-provided quoted examples, which may not reflect real data.
-    for capability in capabilities:
+    # Infer examples from sampled docs to keep planner/worker suggestions grounded in data.
+    for capability in applicable_capabilities:
         capability_id = _normalize_text(capability.get("id", "")).lower()
         if not capability_id:
             continue
@@ -1565,8 +2113,10 @@ def apply_capability_driven_verification(
         capability["examples"] = inferred_examples
 
     selected_indexes_for_indexing: list[int] = []
-    for capability in capabilities:
-        capability_id = str(capability.get("id", ""))
+    for capability in applicable_capabilities:
+        capability_id = str(capability.get("id", "")).strip()
+        if not capability_id:
+            continue
         idx = selected_by_capability.get(capability_id)
         if idx is None:
             continue
@@ -1580,12 +2130,111 @@ def apply_capability_driven_verification(
             continue
         selected_indexes_for_indexing.append(idx)
 
+    suggestion_entries: list[dict[str, object]] = []
+    for capability in applicable_capabilities:
+        capability_id = str(capability.get("id", "")).strip()
+        if not capability_id:
+            continue
+        idx = selected_by_capability.get(capability_id)
+        if idx is None:
+            continue
+        entry = _build_suggestion_entry(capability, features_list[idx])
+        if entry is not None:
+            suggestion_entries.append(entry)
+
+    result["suggestion_meta"] = _dedupe_suggestion_meta(suggestion_entries) if suggestion_entries else []
+    result["selected_indexes_for_indexing"] = selected_indexes_for_indexing
+    notes.extend(selection_notes)
     if not selected_indexes_for_indexing:
-        result["notes"] = notes + ["no documents selected for indexing"]
+        notes.append("no documents selected for indexing")
+    result["notes"] = notes
+    return result
+
+
+def preview_capability_driven_verification(
+    worker_output: str,
+    count: int = 10,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> dict[str, object]:
+    evaluation = _evaluate_capability_driven_selection(
+        worker_output=worker_output,
+        count=count,
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+        field_specs=None,
+    )
+    return {
+        "capabilities": evaluation.get("capabilities", []),
+        "applicable_capabilities": evaluation.get("applicable_capabilities", []),
+        "skipped_capabilities": evaluation.get("skipped_capabilities", []),
+        "suggestion_meta": evaluation.get("suggestion_meta", []),
+        "selected_doc_count": len(evaluation.get("selected_indexes_for_indexing", [])),
+        "notes": evaluation.get("notes", []),
+    }
+
+
+
+def apply_capability_driven_verification(
+    worker_output: str,
+    index_name: str = "",
+    count: int = 10,
+    id_prefix: str = "verification",
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+    existing_verification_doc_ids: str = "",
+) -> dict[str, object]:
+    effective_count = max(1, min(count, 100))
+    target_index = (index_name or "").strip()
+    result: dict[str, object] = {
+        "applied": False,
+        "index_name": target_index,
+        "capabilities": [],
+        "applicable_capabilities": [],
+        "skipped_capabilities": [],
+        "indexed_count": 0,
+        "doc_ids": [],
+        "suggestion_meta": [],
+        "notes": [],
+    }
+
+    if not target_index:
+        result["notes"] = [
+            "index_name is required for apply_capability_driven_verification; "
+            "fallback index resolution is disabled."
+        ]
         return result
 
-    existing_ids = list(_VERIFICATION_DOC_TRACKER.get(target_index, []))
-    for existing_id in existing_ids:
+    try:
+        opensearch_client = _create_client()
+    except Exception as e:
+        result["notes"] = [f"failed to connect to OpenSearch: {e}"]
+        return result
+
+    field_specs = _extract_index_field_specs(opensearch_client, target_index)
+    evaluation = _evaluate_capability_driven_selection(
+        worker_output=worker_output,
+        count=effective_count,
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+        field_specs=field_specs,
+    )
+    result["capabilities"] = list(evaluation.get("capabilities", []))
+    result["applicable_capabilities"] = list(evaluation.get("applicable_capabilities", []))
+    result["skipped_capabilities"] = list(evaluation.get("skipped_capabilities", []))
+    result["suggestion_meta"] = list(evaluation.get("suggestion_meta", []))
+    result["notes"] = list(evaluation.get("notes", []))
+
+    selected_indexes_for_indexing = list(evaluation.get("selected_indexes_for_indexing", []))
+    features_list = list(evaluation.get("features_list", []))
+    if not selected_indexes_for_indexing:
+        return result
+
+    for existing_id in _parse_id_list(existing_verification_doc_ids):
         try:
             opensearch_client.delete(index=target_index, id=existing_id, ignore=[404])
         except Exception:
@@ -1604,24 +2253,8 @@ def apply_capability_driven_verification(
 
     if indexed_ids:
         opensearch_client.indices.refresh(index=target_index)
-        _VERIFICATION_DOC_TRACKER[target_index] = indexed_ids
-        _LAST_VERIFICATION_INDEX = target_index
 
-    suggestion_entries: list[dict[str, object]] = []
-    for capability in capabilities:
-        capability_id = str(capability.get("id", ""))
-        idx = selected_by_capability.get(capability_id)
-        if idx is None:
-            continue
-        entry = _build_suggestion_entry(capability, features_list[idx])
-        if entry is not None:
-            suggestion_entries.append(entry)
-
-    if suggestion_entries:
-        _SEARCH_UI_SUGGESTION_META_BY_INDEX[target_index] = _dedupe_suggestion_meta(suggestion_entries)
-    else:
-        _SEARCH_UI_SUGGESTION_META_BY_INDEX.pop(target_index, None)
-
+    notes = list(evaluation.get("notes", []))
     notes.extend(index_errors)
     result["notes"] = notes
     result["indexed_count"] = len(indexed_ids)
@@ -1663,7 +2296,11 @@ def _suggestion_candidates_from_doc(source: dict) -> list[str]:
     return [text for _, text in scored]
 
 def _search_ui_suggestions(
-    index_name: str, max_count: int = 6
+    index_name: str,
+    max_count: int = 6,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
 ) -> tuple[list[str], list[dict[str, object]]]:
     """Generate search suggestions for the given index.
     
@@ -1677,6 +2314,8 @@ def _search_ui_suggestions(
     deduped: list[str] = []
     deduped_meta: list[dict[str, object]] = []
     seen: set[str] = set()
+    explicit_meta_entries = _search_ui.suggestion_meta_by_index.get(index_name, [])
+    has_explicit_meta = bool(index_name) and index_name in _search_ui.suggestion_meta_by_index
 
     def _append(text_value: object, meta_entry: dict[str, object] | None = None) -> None:
         # _normalize_text collapses whitespace; if the result is an empty string, it's skipped.
@@ -1708,10 +2347,15 @@ def _search_ui_suggestions(
             }
         deduped_meta.append(merged)
 
-    for entry in _SEARCH_UI_SUGGESTION_META_BY_INDEX.get(index_name, []):
+    for entry in explicit_meta_entries:
         _append(entry.get("text", ""), entry)
         if len(deduped) >= max_count:
             return deduped, deduped_meta
+
+    # If suggestions were explicitly set for this index (even an empty list),
+    # do not mix in fallback suggestions from existing index documents.
+    if has_explicit_meta:
+        return deduped[:max_count], deduped_meta[:max_count]
 
     if index_name:
         try:
@@ -1733,7 +2377,12 @@ def _search_ui_suggestions(
 
     if not deduped:
         # If we still don't have enough unique suggestions, fetch some more sample documents.
-        for doc in get_sample_docs_payload(max_count * 2):
+        for doc in _load_sample_docs(
+            limit=max_count * 2,
+            sample_doc_json=sample_doc_json,
+            source_local_file=source_local_file,
+            source_index_name=source_index_name,
+        ):
             for suggestion in _suggestion_candidates_from_doc(doc):
                 _append(suggestion)
                 # early return: the function stops processing well before all max_count * 2 docs are examined. 
@@ -1972,6 +2621,22 @@ _NUMERIC_FIELD_TYPES = {
     "scaled_float",
 }
 _KEYWORD_FIELD_TYPES = {"keyword", "constant_keyword"}
+_EXACT_TERM_FIELD_TYPES = _KEYWORD_FIELD_TYPES | _NUMERIC_FIELD_TYPES | {
+    "boolean",
+    "date",
+    "date_nanos",
+    "ip",
+    "version",
+    "unsigned_long",
+}
+_STRUCTURED_QUERY_PAIR_PATTERN = re.compile(
+    r"""
+    (?P<field>[A-Za-z0-9_.-]+)\s*:\s*
+    (?P<value>"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|.*?)
+    (?:(?:\s+and\s+)(?=[A-Za-z0-9_.-]+\s*:)|$)
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 def _resolve_text_query_fields(field_specs: dict[str, dict[str, str]], limit: int = 6) -> list[str]:
@@ -2020,6 +2685,72 @@ def _resolve_text_query_fields(field_specs: dict[str, dict[str, str]], limit: in
         ranked = sorted(keyword_fields, key=_score)
     selected = ranked[: max(1, limit)]
     return selected if selected else ["*"]
+
+
+def _resolve_exact_field_from_hint(
+    field_specs: dict[str, dict[str, str]],
+    field_hint: str,
+) -> tuple[str, str, bool]:
+    """Resolve the best exact-match field and query mode from a hint.
+
+    Returns ``(field_name, query_mode, case_insensitive)`` where query_mode is
+    ``"term"`` or ``"match_phrase"``.
+    """
+    hint = _normalize_text(field_hint)
+    if not hint:
+        return "", "", False
+
+    resolved_field, resolved_spec = _resolve_field_spec_for_doc_key(hint, field_specs)
+    candidate_field = resolved_field or hint
+    field_type = str((resolved_spec or {}).get("type", "")).strip().lower()
+    normalizer = str((resolved_spec or {}).get("normalizer", "")).strip().lower()
+
+    def _pick_keyword_subfield(base_field: str) -> tuple[str, dict[str, str]]:
+        prefix = f"{base_field}."
+        keyword_candidates: list[tuple[str, dict[str, str]]] = []
+        for name, spec in field_specs.items():
+            normalized_type = str(spec.get("type", "")).strip().lower()
+            if not name.startswith(prefix):
+                continue
+            if normalized_type not in _KEYWORD_FIELD_TYPES:
+                continue
+            keyword_candidates.append((name, spec))
+        if not keyword_candidates:
+            return "", {}
+        keyword_candidates.sort(
+            key=lambda item: (
+                0 if item[0].endswith(".keyword") else 1,
+                item[0].count("."),
+                len(item[0]),
+                item[0],
+            )
+        )
+        return keyword_candidates[0]
+
+    if field_type == "text":
+        keyword_field, keyword_spec = _pick_keyword_subfield(candidate_field)
+        if keyword_field:
+            keyword_normalizer = str(keyword_spec.get("normalizer", "")).strip().lower()
+            return keyword_field, "term", "lower" in keyword_normalizer
+        return candidate_field, "match_phrase", False
+
+    if field_type in _EXACT_TERM_FIELD_TYPES:
+        return candidate_field, "term", "lower" in normalizer
+
+    if candidate_field.endswith(".keyword"):
+        return candidate_field, "term", "lower" in normalizer
+
+    keyword_field, keyword_spec = _pick_keyword_subfield(candidate_field)
+    if keyword_field:
+        keyword_normalizer = str(keyword_spec.get("normalizer", "")).strip().lower()
+        return keyword_field, "term", "lower" in keyword_normalizer
+
+    if field_type in {"match_only_text"}:
+        return candidate_field, "match_phrase", False
+
+    if field_type:
+        return candidate_field, "term", "lower" in normalizer
+    return "", "", False
 
 
 def _resolve_semantic_runtime_hints(
@@ -2140,32 +2871,86 @@ def _coerce_structured_value(raw_value: str, field_type: str) -> object:
     return normalized
 
 
-def _parse_structured_clause(
+def _strip_wrapping_quotes(value_text: str) -> str:
+    normalized = _normalize_text(value_text)
+    if len(normalized) >= 2 and (
+        (normalized[0] == normalized[-1] == '"')
+        or (normalized[0] == normalized[-1] == "'")
+    ):
+        return _normalize_text(normalized[1:-1])
+    return normalized
+
+
+def _parse_structured_pairs(query_text: str) -> list[tuple[str, str]]:
+    normalized_query = _normalize_text(query_text)
+    if ":" not in normalized_query:
+        return []
+
+    pairs: list[tuple[str, str]] = []
+    cursor = 0
+    for match in _STRUCTURED_QUERY_PAIR_PATTERN.finditer(normalized_query):
+        gap = normalized_query[cursor:match.start()].strip()
+        if gap:
+            return []
+
+        field_name = _normalize_text(match.group("field"))
+        value_text = _strip_wrapping_quotes(match.group("value"))
+        if not field_name or not value_text:
+            return []
+
+        pairs.append((field_name, value_text))
+        cursor = match.end()
+
+    if not pairs:
+        return []
+    if normalized_query[cursor:].strip():
+        return []
+    return pairs
+
+
+def _split_structured_clauses(
+    clauses: list[dict[str, object]],
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    text_clauses: list[dict[str, object]] = []
+    filter_clauses: list[dict[str, object]] = []
+    for clause in clauses:
+        if "match_phrase" in clause:
+            text_clauses.append(clause)
+        else:
+            filter_clauses.append(clause)
+    return text_clauses, filter_clauses
+
+
+def _parse_structured_clauses(
     query_text: str,
     suggestion_meta: dict[str, object] | None,
     field_specs: dict[str, dict[str, str]],
-) -> tuple[dict | None, str]:
-    field_name = _normalize_text((suggestion_meta or {}).get("field", ""))
-    value_text = _normalize_text((suggestion_meta or {}).get("value", ""))
+) -> tuple[list[dict[str, object]] | None, str]:
+    parsed_pairs = _parse_structured_pairs(query_text)
 
-    if not field_name or not value_text:
-        match = re.match(r"^\s*([A-Za-z0-9_.-]+)\s*:\s*(.+)\s*$", query_text)
-        if match:
-            field_name = _normalize_text(match.group(1))
-            value_text = _normalize_text(match.group(2))
+    if not parsed_pairs:
+        fallback_field = _normalize_text((suggestion_meta or {}).get("field", ""))
+        fallback_value = _normalize_text((suggestion_meta or {}).get("value", ""))
+        if fallback_field and fallback_value:
+            parsed_pairs = [(fallback_field, fallback_value)]
 
-    if not field_name or not value_text:
+    if not parsed_pairs:
         return None, "structured query missing field/value"
 
-    resolved_field, resolved_spec = _resolve_field_spec_for_doc_key(field_name, field_specs)
-    target_field = resolved_field or field_name
-    field_type = str(resolved_spec.get("type", "")).strip()
+    clauses: list[dict[str, object]] = []
+    for field_name, value_text in parsed_pairs:
+        resolved_field, resolved_spec = _resolve_field_spec_for_doc_key(field_name, field_specs)
+        target_field = resolved_field or field_name
+        field_type = str(resolved_spec.get("type", "")).strip()
 
-    if field_type == "text":
-        return {"match_phrase": {target_field: value_text}}, ""
+        if field_type == "text":
+            clauses.append({"match_phrase": {target_field: value_text}})
+            continue
 
-    coerced_value = _coerce_structured_value(value_text, field_type)
-    return {"term": {target_field: {"value": coerced_value}}}, ""
+        coerced_value = _coerce_structured_value(value_text, field_type)
+        clauses.append({"term": {target_field: {"value": coerced_value}}})
+
+    return clauses, ""
 
 
 def _build_neural_clause(query: str, vector_field: str, model_id: str, size: int) -> dict:
@@ -2185,6 +2970,8 @@ def _search_ui_search(
     query_text: str,
     size: int = 10,
     debug: bool = False,
+    search_intent: str = "",
+    field_hint: str = "",
 ) -> dict:
     if not index_name:
         return {
@@ -2207,7 +2994,23 @@ def _search_ui_search(
 
     field_specs = _extract_index_field_specs(opensearch_client, index_name)
     lexical_fields = _resolve_text_query_fields(field_specs)
+    normalized_intent = _normalize_text(search_intent).lower()
+    resolved_field_hint = _normalize_text(field_hint)
+
     suggestion_meta = _find_suggestion_meta(index_name, query) if query else None
+    if query and normalized_intent == "autocomplete_selection" and resolved_field_hint:
+        exact_field, exact_mode, case_insensitive = _resolve_exact_field_from_hint(
+            field_specs=field_specs,
+            field_hint=resolved_field_hint,
+        )
+        if exact_field and exact_mode:
+            suggestion_meta = {
+                "capability": "exact",
+                "query_mode": exact_mode,
+                "field": exact_field,
+                "value": "",
+                "case_insensitive": case_insensitive,
+            }
     if suggestion_meta is not None:
         resolved_capability = _normalize_text(suggestion_meta.get("capability", "")).lower()
         if resolved_capability:
@@ -2219,7 +3022,18 @@ def _search_ui_search(
         model_id = runtime_hints.get("model_id", "")
         semantic_ready = bool(vector_field and model_id)
         lexical_query = _build_default_lexical_query(query=query, fields=lexical_fields)
+        manual_structured_clauses: list[dict[str, object]] | None = None
 
+        if capability == "manual":
+            manual_structured_clauses, _ = _parse_structured_clauses(
+                query_text=query,
+                suggestion_meta=None,
+                field_specs=field_specs,
+            )
+            if manual_structured_clauses is not None:
+                capability = "structured"
+
+        # builds term / match_phrase DSL for exact-match queries
         if capability == "exact" and suggestion_meta is not None:
             exact_mode = _normalize_text(suggestion_meta.get("query_mode", ""))
             field = _normalize_text(suggestion_meta.get("field", ""))
@@ -2250,31 +3064,29 @@ def _search_ui_search(
                 executed_body = _build_default_lexical_body(query=query, size=size, fields=lexical_fields)
                 query_mode = "exact_bm25_fallback"
         elif capability == "structured":
-            structured_clause, structured_error = _parse_structured_clause(
-                query_text=query,
-                suggestion_meta=suggestion_meta,
-                field_specs=field_specs,
-            )
-            if structured_clause is None:
+            structured_clauses = manual_structured_clauses
+            structured_error = ""
+            if structured_clauses is None:
+                structured_clauses, structured_error = _parse_structured_clauses(
+                    query_text=query,
+                    suggestion_meta=suggestion_meta,
+                    field_specs=field_specs,
+                )
+            if structured_clauses is None:
                 fallback_reason = structured_error
                 executed_body = _build_default_lexical_body(query=query, size=size, fields=lexical_fields)
                 query_mode = "structured_bm25_fallback"
             else:
-                if "match_phrase" in structured_clause:
-                    executed_body = {
-                        "size": size,
-                        "query": structured_clause,
-                    }
-                else:
-                    executed_body = {
-                        "size": size,
-                        "query": {
-                            "bool": {
-                                "filter": [structured_clause],
-                                "must": [{"match_all": {}}],
-                            }
-                        },
-                    }
+                text_clauses, filter_clauses = _split_structured_clauses(structured_clauses)
+                bool_query: dict[str, object] = {}
+                if text_clauses:
+                    bool_query["must"] = text_clauses
+                if filter_clauses:
+                    bool_query["filter"] = filter_clauses
+                executed_body = {
+                    "size": size,
+                    "query": {"bool": bool_query} if bool_query else {"match_all": {}},
+                }
                 query_mode = "structured_filter"
         elif capability == "autocomplete":
             field = _normalize_text((suggestion_meta or {}).get("field", ""))
@@ -2314,16 +3126,18 @@ def _search_ui_search(
                 query_mode = "fuzzy_bm25_fallback"
                 fallback_reason = "fuzzy field unresolved"
         elif capability in {"semantic", "combined", "manual"}:
-            structured_clause = None
+            structured_clauses: list[dict[str, object]] | None = None
             if capability == "combined":
-                structured_clause, structured_error = _parse_structured_clause(
+                structured_clauses, structured_error = _parse_structured_clauses(
                     query_text=query,
                     suggestion_meta=suggestion_meta,
                     field_specs=field_specs,
                 )
-                if structured_clause is None:
+                if structured_clauses is None:
                     fallback_reason = structured_error
 
+            # builds hybrid query for combined/semantic capabilities
+            # semantic is transformed to hybrid of lexical and neural queries
             if semantic_ready:
                 neural_query = _build_neural_clause(
                     query=query,
@@ -2339,30 +3153,40 @@ def _search_ui_search(
                         ]
                     }
                 }
-                if capability == "combined" and structured_clause is not None:
-                    if "match_phrase" in structured_clause:
+                used_semantic_now = True
+                if capability == "combined" and structured_clauses is not None:
+                    text_clauses, filter_clauses = _split_structured_clauses(structured_clauses)
+                    if text_clauses:
+                        must_clauses: list[dict[str, object]] = [base_hybrid]
+                        must_clauses.extend(text_clauses)
+                        bool_query: dict[str, object] = {"must": must_clauses}
+                        if filter_clauses:
+                            bool_query["filter"] = filter_clauses
+                        executed_body = {
+                            "size": size,
+                            "query": {
+                                "bool": bool_query,
+                            },
+                        }
+                        query_mode = "combined_hybrid"
+                    elif filter_clauses:
+                        # Structured-only combined queries should not require lexical/semantic must clauses.
                         executed_body = {
                             "size": size,
                             "query": {
                                 "bool": {
-                                    "must": [
-                                        base_hybrid,
-                                        structured_clause,
-                                    ]
+                                    "filter": filter_clauses,
                                 }
                             },
                         }
+                        query_mode = "combined_structured_filter"
+                        used_semantic_now = False
                     else:
                         executed_body = {
                             "size": size,
-                            "query": {
-                                "bool": {
-                                    "must": [base_hybrid],
-                                    "filter": [structured_clause],
-                                }
-                            },
+                            "query": base_hybrid,
                         }
-                    query_mode = "combined_hybrid"
+                        query_mode = "combined_hybrid"
                 elif capability == "semantic":
                     executed_body = {
                         "size": size,
@@ -2375,7 +3199,7 @@ def _search_ui_search(
                         "query": base_hybrid,
                     }
                     query_mode = "hybrid_default"
-                used_semantic = True
+                used_semantic = used_semantic_now
             else:
                 missing_parts: list[str] = []
                 if not vector_field:
@@ -2388,8 +3212,25 @@ def _search_ui_search(
                     if fallback_reason
                     else f"semantic runtime unresolved ({missing_text})"
                 )
-                executed_body = _build_default_lexical_body(query=query, size=size, fields=lexical_fields)
-                query_mode = f"{capability}_bm25_fallback"
+                if capability == "combined" and structured_clauses is not None:
+                    text_clauses, filter_clauses = _split_structured_clauses(structured_clauses)
+                    bool_query: dict[str, object] = {}
+                    if text_clauses:
+                        must_clauses: list[dict[str, object]] = [lexical_query]
+                        must_clauses.extend(text_clauses)
+                        bool_query["must"] = must_clauses
+                    if filter_clauses:
+                        bool_query["filter"] = filter_clauses
+                    executed_body = {
+                        "size": size,
+                        "query": {
+                            "bool": bool_query if bool_query else {"must": [lexical_query]},
+                        },
+                    }
+                    query_mode = "combined_lexical_filter"
+                else:
+                    executed_body = _build_default_lexical_body(query=query, size=size, fields=lexical_fields)
+                    query_mode = f"{capability}_bm25_fallback"
         else:
             executed_body = _build_default_lexical_body(query=query, size=size, fields=lexical_fields)
             query_mode = "bm25_default"
@@ -2439,8 +3280,6 @@ def _search_ui_search(
 def _resolve_default_index(preferred_index: str = "") -> str:
     if preferred_index:
         return preferred_index
-    if _LAST_VERIFICATION_INDEX:
-        return _LAST_VERIFICATION_INDEX
     try:
         opensearch_client = _create_client()
         indices = opensearch_client.cat.indices(format="json")
@@ -2508,15 +3347,15 @@ class _SearchUIRequestHandler(BaseHTTPRequestHandler):
         params = parse_qs(parsed.query)
 
         if parsed.path == "/api/health":
-            self._write_json({"ok": True, "default_index": _SEARCH_UI_DEFAULT_INDEX})
+            self._write_json({"ok": True, "default_index": _search_ui.default_index})
             return
 
         if parsed.path == "/api/config":
-            self._write_json({"default_index": _SEARCH_UI_DEFAULT_INDEX})
+            self._write_json({"default_index": _search_ui.default_index})
             return
 
         if parsed.path == "/api/suggestions":
-            index_name = params.get("index", [""])[0] or _SEARCH_UI_DEFAULT_INDEX
+            index_name = params.get("index", [""])[0] or _search_ui.default_index
             suggestions, suggestion_meta = _search_ui_suggestions(index_name, max_count=6)
             self._write_json(
                 {
@@ -2528,7 +3367,7 @@ class _SearchUIRequestHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/autocomplete":
-            index_name = params.get("index", [""])[0] or _SEARCH_UI_DEFAULT_INDEX
+            index_name = params.get("index", [""])[0] or _search_ui.default_index
             prefix_text = params.get("q", [""])[0]
             field_name = params.get("field", [""])[0]
             try:
@@ -2546,8 +3385,10 @@ class _SearchUIRequestHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/search":
-            index_name = params.get("index", [""])[0] or _SEARCH_UI_DEFAULT_INDEX
+            index_name = params.get("index", [""])[0] or _search_ui.default_index
             query_text = params.get("q", [""])[0]
+            search_intent = params.get("intent", [""])[0]
+            field_hint = params.get("field", [""])[0]
             debug_param = params.get("debug", ["0"])[0].strip().lower()
             debug_mode = debug_param in {"1", "true", "yes", "on"}
             try:
@@ -2562,6 +3403,8 @@ class _SearchUIRequestHandler(BaseHTTPRequestHandler):
                     query_text=query_text,
                     size=size,
                     debug=debug_mode,
+                    search_intent=search_intent,
+                    field_hint=field_hint,
                 )
                 self._write_json(result)
             except Exception as e:
@@ -2591,9 +3434,7 @@ class _SearchUIRequestHandler(BaseHTTPRequestHandler):
 
 
 def _start_search_ui_server(preferred_index: str = "") -> str:
-    global _SEARCH_UI_SERVER, _SEARCH_UI_SERVER_THREAD, _SEARCH_UI_DEFAULT_INDEX
-
-    with _SEARCH_UI_SERVER_LOCK:
+    with _search_ui.lock:
         if not SEARCH_UI_STATIC_DIR.exists():
             raise RuntimeError(f"Search UI static directory not found: {SEARCH_UI_STATIC_DIR}")
         if _resolve_search_ui_asset("/index.html") is None:
@@ -2601,17 +3442,17 @@ def _start_search_ui_server(preferred_index: str = "") -> str:
 
         resolved_index = _resolve_default_index(preferred_index)
         if resolved_index:
-            _SEARCH_UI_DEFAULT_INDEX = resolved_index
+            _search_ui.default_index = resolved_index
 
-        if _SEARCH_UI_SERVER is not None and _SEARCH_UI_SERVER_THREAD is not None:
-            if _SEARCH_UI_SERVER_THREAD.is_alive():
+        if _search_ui.server is not None and _search_ui.thread is not None:
+            if _search_ui.thread.is_alive():
                 return _search_ui_public_url()
 
         server = ThreadingHTTPServer((SEARCH_UI_HOST, SEARCH_UI_PORT), _SearchUIRequestHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        _SEARCH_UI_SERVER = server
-        _SEARCH_UI_SERVER_THREAD = thread
+        _search_ui.server = server
+        _search_ui.thread = thread
 
     return _search_ui_public_url()
 
@@ -2665,14 +3506,24 @@ def set_ml_settings(opensearch_client: OpenSearch | None = None) -> None:
     opensearch_client.transport.perform_request("PUT", "/_cluster/settings", body=body)
 
 
-@tool
-def create_index(index_name: str, body: dict = None, replace_if_exists: bool = True) -> str:
+
+def create_index(
+    index_name: str,
+    body: dict = None,
+    replace_if_exists: bool = True,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> str:
     """Create an OpenSearch index with the specified configuration.
 
     Args:
         index_name: The name of the index to create.
         body: The configuration body for the index (settings and mappings).
         replace_if_exists: Delete and recreate the index if it already exists.
+        sample_doc_json: JSON string of a single sample document for type guardrails.
+        source_local_file: Path to the local file the sample was loaded from.
+        source_index_name: Localhost OpenSearch index name used as sample source.
 
     Returns:
         str: Success message or error.
@@ -2683,11 +3534,12 @@ def create_index(index_name: str, body: dict = None, replace_if_exists: bool = T
         body = {}
     knn_engine_updates = _normalize_knn_method_engines(body)
 
-    sample_docs = [
-        doc
-        for doc in get_sample_docs_payload(limit=200)
-        if isinstance(doc, dict)
-    ]
+    sample_docs = _load_sample_docs(
+        limit=200,
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+    )
     requested_field_types = _extract_declared_field_types_from_index_body(body)
 
     def _index_exists(opensearch_client: OpenSearch, target_index: str) -> bool:
@@ -2712,8 +3564,6 @@ def create_index(index_name: str, body: dict = None, replace_if_exists: bool = T
     if existed_before and replace_if_exists:
         try:
             opensearch_client.indices.delete(index=index_name, ignore=[404])
-            _VERIFICATION_DOC_TRACKER.pop(index_name, None)
-            _SEARCH_UI_SUGGESTION_META_BY_INDEX.pop(index_name, None)
         except Exception as e:
             return f"Failed to recreate index '{index_name}': failed to delete existing index: {e}"
 
@@ -2757,8 +3607,6 @@ def create_index(index_name: str, body: dict = None, replace_if_exists: bool = T
                 try:
                     opensearch_client.indices.delete(index=index_name, ignore=[404])
                     opensearch_client.indices.create(index=index_name, body=body)
-                    _VERIFICATION_DOC_TRACKER.pop(index_name, None)
-                    _SEARCH_UI_SUGGESTION_META_BY_INDEX.pop(index_name, None)
                     normalized_note = ""
                     if knn_engine_updates:
                         normalized_note = (
@@ -2790,7 +3638,7 @@ def create_index(index_name: str, body: dict = None, replace_if_exists: bool = T
             return f"Index '{index_name}' already exists."
         return f"Failed to create index '{index_name}': {e}"
 
-@tool
+
 def create_bedrock_embedding_model(model_name: str) -> str:
     """Create a Bedrock embedding model with the specified configuration.
     
@@ -2874,7 +3722,7 @@ def create_bedrock_embedding_model(model_name: str) -> str:
                 model_id = task_res.get("model_id")
                 break
             elif state == "FAILED":
-                return f"Model registration failed: {task_res.get('error')}"
+                return _format_model_failure_message("registration", task_res.get("error"))
             time.sleep(2)
             
         if not model_id:
@@ -2893,7 +3741,7 @@ def create_bedrock_embedding_model(model_name: str) -> str:
             if state == "COMPLETED":
                 return f"Model '{model_name}' (ID: {model_id}) created and deployed successfully."
             elif state == "FAILED":
-                return f"Model deployment failed: {task_res.get('error')}"
+                return _format_model_failure_message("deployment", task_res.get("error"))
             time.sleep(2)
 
         return f"Model deployment timed out. Model ID: {model_id}"
@@ -2902,7 +3750,7 @@ def create_bedrock_embedding_model(model_name: str) -> str:
         return f"Error creating Bedrock model: {e}"
 
 
-@tool
+
 def create_and_attach_pipeline(
     pipeline_name: str,
     pipeline_body: dict,
@@ -3165,7 +4013,6 @@ def create_and_attach_pipeline(
             if unresolved:
                 requested_fields = _extract_pipeline_source_fields(pipeline_body)
                 available_fields = sorted(mapped_fields.keys())
-                set_ingest_source_field_hints([])
                 return (
                     "Error: Ingest pipeline field_map source fields are invalid for this index mapping. "
                     f"Requested source fields: {requested_fields or ['(none)']}. "
@@ -3189,10 +4036,11 @@ def create_and_attach_pipeline(
             if existed_before and not replace_if_exists:
                 settings = {"index.default_pipeline": pipeline_name}
                 opensearch_client.indices.put_settings(index=index_name, body=settings)
-                set_ingest_source_field_hints(_extract_pipeline_source_fields(normalized_pipeline_body))
+                source_fields = _extract_pipeline_source_fields(normalized_pipeline_body)
+                hints_csv = ",".join(normalize_ingest_source_field_hints(source_fields))
                 return (
                     f"Ingest pipeline '{pipeline_name}' already exists and is attached to index "
-                    f"'{index_name}'."
+                    f"'{index_name}'. ingest_source_field_hints: {hints_csv}"
                 )
 
             opensearch_client.ingest.put_pipeline(id=pipeline_name, body=normalized_pipeline_body)
@@ -3245,12 +4093,18 @@ def create_and_attach_pipeline(
         opensearch_client.indices.put_settings(index=index_name, body=settings)
         action = "recreated" if (existed_before and replace_if_exists) else "created"
         if pipeline_type == "ingest":
-            set_ingest_source_field_hints(_extract_pipeline_source_fields(normalized_pipeline_body))
+            source_fields = _extract_pipeline_source_fields(normalized_pipeline_body)
+            hints_csv = ",".join(normalize_ingest_source_field_hints(source_fields))
+            suffix = f" ingest_source_field_hints: {hints_csv}"
             if remap_notes:
                 return (
                     f"{pipeline_type.capitalize()} pipeline '{pipeline_name}' {action} and attached to index '{index_name}' successfully. "
-                    f"field remap: {'; '.join(remap_notes)}"
+                    f"field remap: {'; '.join(remap_notes)}.{suffix}"
                 )
+            return (
+                f"{pipeline_type.capitalize()} pipeline '{pipeline_name}' {action} and attached to index "
+                f"'{index_name}' successfully.{suffix}"
+            )
         return (
             f"{pipeline_type.capitalize()} pipeline '{pipeline_name}' {action} and attached to index "
             f"'{index_name}' successfully."
@@ -3260,7 +4114,7 @@ def create_and_attach_pipeline(
         return f"Failed to create and attach pipeline: {e}"
 
 
-@tool
+
 def create_local_pretrained_model(model_name: str) -> str:
     """Create a local pretrained model in OpenSearch.
 
@@ -3307,7 +4161,7 @@ def create_local_pretrained_model(model_name: str) -> str:
                 model_id = task_res.get("model_id")
                 break
             elif state == "FAILED":
-                return f"Model registration failed: {task_res.get('error')}"
+                return _format_model_failure_message("registration", task_res.get("error"))
             time.sleep(5)
             
         if not model_id:
@@ -3326,7 +4180,7 @@ def create_local_pretrained_model(model_name: str) -> str:
             if state == "COMPLETED":
                 return f"Model '{model_name}' (ID: {model_id}) created and deployed successfully."
             elif state == "FAILED":
-                return f"Model deployment failed: {task_res.get('error')}"
+                return _format_model_failure_message("deployment", task_res.get("error"))
             time.sleep(3)
 
         return f"Model deployment timed out. Model ID: {model_id}"
@@ -3334,7 +4188,7 @@ def create_local_pretrained_model(model_name: str) -> str:
     except Exception as e:
         return f"Error creating local pretrained model: {e}"
 
-@tool
+
 def index_doc(index_name: str, doc: dict, doc_id: str) -> str:
     """Index a document into an OpenSearch index.
 
@@ -3364,22 +4218,35 @@ def index_doc(index_name: str, doc: dict, doc_id: str) -> str:
         return f"Failed to get document after ingest pipeline: {e}"
 
 
-@tool
-def index_verification_docs(index_name: str, count: int = 10, id_prefix: str = "verification") -> str:
+
+def index_verification_docs(
+    index_name: str,
+    count: int = 10,
+    id_prefix: str = "verification",
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> str:
     """Index verification docs from collected sample data for UI testing.
 
     Args:
         index_name: Target index name.
         count: Number of docs to index (default 10, max 100).
         id_prefix: Prefix for generated doc IDs.
+        sample_doc_json: JSON string of a single sample document.
+        source_local_file: Path to the local file the sample was loaded from.
+        source_index_name: Localhost OpenSearch index name used as sample source.
 
     Returns:
         str: JSON summary of indexed IDs and any errors.
     """
-    global _LAST_VERIFICATION_INDEX
-
     effective_count = max(1, min(count, 100))
-    docs = get_sample_docs_payload(effective_count)
+    docs = _load_sample_docs(
+        limit=effective_count,
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+    )
     if not docs:
         return (
             "Failed to index verification docs: no sample docs available. "
@@ -3401,16 +4268,6 @@ def index_verification_docs(index_name: str, count: int = 10, id_prefix: str = "
     if indexed_ids:
         opensearch_client.indices.refresh(index=index_name)
 
-    existing = set(_VERIFICATION_DOC_TRACKER.get(index_name, []))
-    if index_name not in _VERIFICATION_DOC_TRACKER:
-        _VERIFICATION_DOC_TRACKER[index_name] = []
-    for doc_id in indexed_ids:
-        if doc_id not in existing:
-            _VERIFICATION_DOC_TRACKER[index_name].append(doc_id)
-
-    if indexed_ids:
-        _LAST_VERIFICATION_INDEX = index_name
-
     result = {
         "index_name": index_name,
         "requested_count": effective_count,
@@ -3422,7 +4279,7 @@ def index_verification_docs(index_name: str, count: int = 10, id_prefix: str = "
     return json.dumps(result, ensure_ascii=False)
 
 
-@tool
+
 def launch_search_ui(index_name: str = "") -> str:
     """Launch local React Search Builder UI for interactive testing."""
     try:
@@ -3443,7 +4300,30 @@ def launch_search_ui(index_name: str = "") -> str:
     )
 
 
-@tool
+def set_search_ui_suggestions(index_name: str, suggestion_meta_json: str) -> str:
+    """Set search UI suggestion metadata for an index.
+
+    Call this after apply_capability_driven_verification to populate the
+    search UI with capability-driven suggestions.
+
+    Args:
+        index_name: Target index name.
+        suggestion_meta_json: JSON array of suggestion entries, each with
+            keys: text, capability, query_mode, field, value, case_insensitive.
+    """
+    target = (index_name or "").strip()
+    if not target:
+        return "index_name is required for set_search_ui_suggestions."
+    try:
+        parsed = json.loads(suggestion_meta_json)
+    except (json.JSONDecodeError, TypeError) as e:
+        return f"Invalid suggestion_meta_json: {e}"
+    if not isinstance(parsed, list):
+        return "suggestion_meta_json must be a JSON array."
+    _search_ui.suggestion_meta_by_index[target] = parsed
+    return f"Set {len(parsed)} suggestions for index '{target}'."
+
+
 def delete_doc(index_name: str, doc_id: str) -> str:
     """Delete a document from an OpenSearch index.
 
@@ -3462,35 +4342,64 @@ def delete_doc(index_name: str, doc_id: str) -> str:
         return f"Failed to delete document: {e}"
 
 
-@tool
-def cleanup_verification_docs(index_name: str = "") -> str:
-    """Delete tracked verification docs (only when user explicitly requests cleanup)."""
-    targets = [index_name] if index_name else list(_VERIFICATION_DOC_TRACKER.keys())
-    if not targets:
-        return "No tracked verification docs found to clean up."
+
+def cleanup_verification_docs(index_name: str = "", doc_ids: str = "") -> str:
+    """Delete verification docs from an index.
+
+    Args:
+        index_name: Target index name. When empty, scans all non-system indices.
+        doc_ids: Comma-separated or JSON list of doc IDs to delete.
+            When empty, scans for docs matching the 'verification-*' ID pattern.
+
+    Returns:
+        str: JSON summary with deleted_docs count and errors.
+    """
+    ids_to_delete = _parse_id_list(doc_ids)
 
     opensearch_client = _create_client()
+
+    target = (index_name or "").strip()
+    targets: list[str] = [target] if target else []
+    if not targets:
+        try:
+            cat_resp = opensearch_client.cat.indices(format="json")
+            targets = [
+                item.get("index", "")
+                for item in cat_resp
+                if item.get("index") and not item.get("index", "").startswith(".")
+            ]
+        except Exception:
+            pass
+    if not targets:
+        return json.dumps({"deleted_docs": 0, "errors": []})
+
     deleted_count = 0
     errors: list[str] = []
 
-    for target in targets:
-        doc_ids = list(_VERIFICATION_DOC_TRACKER.get(target, []))
-        if not doc_ids:
-            continue
-
-        remaining_ids: list[str] = []
-        for doc_id in doc_ids:
+    for idx_name in targets:
+        scan_ids = list(ids_to_delete) if ids_to_delete else []
+        if not scan_ids:
             try:
-                opensearch_client.delete(index=target, id=doc_id, ignore=[404])
+                resp = opensearch_client.search(
+                    index=idx_name,
+                    body={
+                        "size": 500,
+                        "query": {"wildcard": {"_id": {"value": "verification-*"}}},
+                        "_source": False,
+                    },
+                )
+                scan_ids = [
+                    hit["_id"] for hit in resp.get("hits", {}).get("hits", []) if hit.get("_id")
+                ]
+            except Exception:
+                continue
+
+        for doc_id in scan_ids:
+            try:
+                opensearch_client.delete(index=idx_name, id=doc_id, ignore=[404])
                 deleted_count += 1
             except Exception as e:
-                errors.append(f"{target}/{doc_id}: {e}")
-                remaining_ids.append(doc_id)
-
-        if remaining_ids:
-            _VERIFICATION_DOC_TRACKER[target] = remaining_ids
-        elif target in _VERIFICATION_DOC_TRACKER:
-            del _VERIFICATION_DOC_TRACKER[target]
+                errors.append(f"{idx_name}/{doc_id}: {e}")
 
     summary = {"deleted_docs": deleted_count, "errors": errors}
     return json.dumps(summary, ensure_ascii=False)

@@ -457,6 +457,10 @@ To combine scores from different methods (e.g., BM25 scores are unbounded, while
 ### 4.4 Combination Strategy for Relevance
 When maximum relevance is the primary goal, Hybrid Search is the recommended approach.
 
+- **Hybrid Scope Rule**:
+  - Use at most **two retrieval methods** per hybrid query.
+  - Do **not** combine dense + sparse + BM25 in a single hybrid plan.
+
 - **Recommended Combinations**:
   - **Dense + Sparse**: Have best search relevance. Provides two layers of semantic understanding (dense for context, sparse for learned expansion).
   - **Dense + BM25**: A robust baseline to combine semantic understanding with exact keyword precision.

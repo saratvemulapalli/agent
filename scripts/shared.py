@@ -9,6 +9,7 @@ import sys
 import re
 import atexit
 import asyncio
+import json
 
 try:
     import readline  # noqa: F401 — enables line-editing/history for input()
@@ -28,6 +29,34 @@ except ImportError:
     KeyBindings = None
 
 from enum import Enum, auto
+
+
+# -------------------------------------------------------------------------
+# Shared Supported File Formats
+# -------------------------------------------------------------------------
+
+SUPPORTED_SAMPLE_FILE_EXTENSIONS: tuple[str, ...] = (
+    ".tsv",
+    ".tab",
+    ".csv",
+    ".json",
+    ".jsonl",
+    ".ndjson",
+    ".txt",
+    ".parquet",
+)
+SUPPORTED_SAMPLE_FILE_FORMATS_MARKDOWN = ", ".join(
+    f"`{extension}`" for extension in SUPPORTED_SAMPLE_FILE_EXTENSIONS
+)
+SUPPORTED_SAMPLE_FILE_FORMATS_COMMA = ", ".join(SUPPORTED_SAMPLE_FILE_EXTENSIONS)
+SUPPORTED_SAMPLE_FILE_FORMATS_SLASH = "/".join(SUPPORTED_SAMPLE_FILE_EXTENSIONS)
+SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX = "|".join(
+    re.escape(extension) for extension in SUPPORTED_SAMPLE_FILE_EXTENSIONS
+)
+_SUPPORTED_SAMPLE_FILE_EXTENSION_PATTERN = re.compile(
+    rf"(?:{SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX})\b",
+    flags=re.IGNORECASE,
+)
 
 
 # -------------------------------------------------------------------------
@@ -203,6 +232,63 @@ def read_multiline_input() -> str:
     return "\n".join(lines).strip()
 
 
+def read_single_choice_input(
+    title: str,
+    prompt: str,
+    options: list[tuple[str, str]],
+    default_value: str | None = None,
+) -> str | None:
+    """Read one value from a fixed option list using a numbered text prompt.
+
+    Args:
+        title: Short title for the selection prompt.
+        prompt: Question text shown above options.
+        options: Ordered list of ``(value, label)`` pairs.
+        default_value: Optional default choice value.
+
+    Returns:
+        Selected option value, or ``None`` if no selection was made.
+    """
+    if not options:
+        return None
+
+    restore_tty_state()
+    option_map = {value: label for value, label in options}
+    effective_default = default_value if default_value in option_map else options[0][0]
+
+    print(f"\n{title}: {prompt}")
+    for idx, (value, label) in enumerate(options, start=1):
+        marker = " (default)" if value == effective_default else ""
+        print(f"  {idx}. {label}{marker}")
+
+    def _parse_option_index(raw_text: str) -> int | None:
+        normalized = raw_text.strip()
+        if not normalized:
+            return None
+        match = re.fullmatch(r"(\d+)(?:[.)]+)?", normalized)
+        if not match:
+            return None
+        idx = int(match.group(1))
+        if 1 <= idx <= len(options):
+            return idx
+        return None
+
+    while True:
+        raw = input("> ").strip()
+        if not raw:
+            return effective_default
+        if raw in option_map:
+            return raw
+        parsed_idx = _parse_option_index(raw)
+        if parsed_idx is not None:
+            return options[parsed_idx - 1][0]
+        lowered = raw.lower()
+        for value, label in options:
+            if lowered == label.lower():
+                return value
+        print("Please choose a valid option number or press Enter for default.")
+
+
 # -------------------------------------------------------------------------
 # Intent Detection
 # -------------------------------------------------------------------------
@@ -225,11 +311,28 @@ _NEW_REQUEST_PHRASES = (
 _EXECUTION_INTENT_PHRASES = (
     "proceed",
     "go ahead",
+    "move forward",
+    "let's do it",
+    "lets do it",
+    "ready to implement",
+    "continue with implementation",
+    "start implementation",
+    "begin implementation",
+    "implement this",
+    "implement it",
     "setup opensearch",
     "set up opensearch",
     "index data",
     "index this dataset",
-    "implement",
+)
+
+_EXECUTION_NEGATION_PATTERN = re.compile(
+    r"\b(?:do\s+not|don't|not\s+yet|later|hold\s+off|wait|pause|stop)\b.{0,40}\b"
+    r"(?:proceed|go\s+ahead|continue|implement|setup|set\s+up|index)\b"
+    r"|"
+    r"\b(?:proceed|go\s+ahead|continue|implement|setup|set\s+up|index)\b.{0,40}\b"
+    r"(?:do\s+not|don't|not\s+yet|later|hold\s+off|wait|pause|stop)\b",
+    re.IGNORECASE,
 )
 
 _CANCEL_PHRASES = (
@@ -263,6 +366,34 @@ _WORKER_RETRY_PHRASES = (
     "rerun index_verification_docs",
 )
 
+_LOCALHOST_INDEX_HINT_PHRASES = (
+    "localhost index",
+    "local opensearch index",
+    "existing index",
+    "already in index",
+    "already indexed",
+    "index in localhost",
+)
+
+_INDEX_REFERENCE_STOP_WORDS = {
+    "please",
+    "data",
+    "dataset",
+    "localhost",
+    "opensearch",
+    "local",
+    "existing",
+    "already",
+    "index",
+    "indices",
+    "this",
+    "that",
+    "there",
+    "here",
+    "from",
+    "with",
+}
+
 
 def looks_like_new_request(user_input: str) -> bool:
     """Detect if user input indicates a brand-new / unrelated request."""
@@ -272,7 +403,11 @@ def looks_like_new_request(user_input: str) -> bool:
 
 def looks_like_execution_intent(user_input: str) -> bool:
     """Detect if user wants to proceed with execution."""
-    text = user_input.lower()
+    text = (user_input or "").lower().strip()
+    if not text:
+        return False
+    if _EXECUTION_NEGATION_PATTERN.search(text):
+        return False
     return any(phrase in text for phrase in _EXECUTION_INTENT_PHRASES)
 
 
@@ -294,6 +429,114 @@ def looks_like_worker_retry(user_input: str) -> bool:
     return any(phrase in text for phrase in _WORKER_RETRY_PHRASES)
 
 
+def looks_like_builtin_imdb_sample_request(user_input: str) -> bool:
+    """Detect if user asks for the bundled IMDb sample dataset."""
+    raw_text = str(user_input or "").strip()
+    if not raw_text:
+        return False
+
+    # Pasted JSON/NDJSON content should be treated as option 4 sample content.
+    if raw_text.startswith("{") or raw_text.startswith("["):
+        try:
+            parsed_json = json.loads(raw_text)
+        except Exception:
+            parsed_json = None
+        if isinstance(parsed_json, (dict, list)):
+            return False
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        parsed_all_lines = True
+        for line in lines:
+            try:
+                parsed_line = json.loads(line)
+            except Exception:
+                parsed_all_lines = False
+                break
+            if not isinstance(parsed_line, dict):
+                parsed_all_lines = False
+                break
+        if parsed_all_lines:
+            return False
+
+    text = raw_text.lower()
+
+    # If user explicitly references an index, treat it as option 3, not built-in sample data.
+    if re.search(r"\bindex(?:_name)?\s*(?:=|:)\s*[a-z0-9._-]+\b", text):
+        return False
+    in_index_match = re.search(r"\bin\s+index\s+([a-z0-9._-]+)\b", text)
+    if in_index_match and in_index_match.group(1) not in _INDEX_REFERENCE_STOP_WORDS:
+        return False
+
+    if re.search(r"\bimdb\b", text):
+        return True
+
+    return any(
+        phrase in text
+        for phrase in (
+            "built-in sample dataset",
+            "builtin sample dataset",
+            "built-in sample",
+            "builtin sample",
+            "default sample dataset",
+            "default sample",
+        )
+    )
+
+
+def looks_like_localhost_index_message(user_input: str) -> bool:
+    """Detect if user wants to use documents already stored in localhost index."""
+    text = user_input.lower().strip()
+    if not text:
+        return False
+
+    if any(phrase in text for phrase in _LOCALHOST_INDEX_HINT_PHRASES):
+        return True
+
+    has_localhost = any(
+        token in text for token in ("localhost", "127.0.0.1", "0.0.0.0", "::1")
+    )
+    has_index_context = any(token in text for token in ("index", "indexed", "opensearch"))
+    if has_localhost and has_index_context:
+        return True
+
+    # Named index references (e.g., "data is in index imdb_titles", "index=movies").
+    assignment_match = re.search(
+        r"\bindex(?:_name)?\s*(?:=|:)\s*([a-z0-9._-]+)\b",
+        text,
+    )
+    if assignment_match and assignment_match.group(1) not in _INDEX_REFERENCE_STOP_WORDS:
+        return True
+
+    in_index_match = re.search(
+        r"\bin\s+index\s+([a-z0-9._-]+)\b",
+        text,
+    )
+    if in_index_match and in_index_match.group(1) not in _INDEX_REFERENCE_STOP_WORDS:
+        return True
+
+    contextual_match = re.search(
+        r"\b(?:use|using|from|existing)\s+index\s+([a-z0-9._-]+)\b",
+        text,
+    )
+    if contextual_match and contextual_match.group(1) not in _INDEX_REFERENCE_STOP_WORDS:
+        return True
+
+    plain_index_match = re.search(
+        r"\bindex\s+([a-z0-9._-]+)\b",
+        text,
+    )
+    if plain_index_match and plain_index_match.group(1) not in _INDEX_REFERENCE_STOP_WORDS:
+        return True
+
+    return (
+        re.search(
+            r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::\d+)?/[^\s]+",
+            text,
+        )
+        is not None
+    )
+
+
 def looks_like_url_message(user_input: str) -> bool:
     """Detect if user input contains an HTTP/HTTPS URL."""
     text = user_input.strip()
@@ -313,7 +556,7 @@ def looks_like_local_path_message(user_input: str) -> bool:
         return True
     if re.search(r"/[A-Za-z0-9._-]+", text):
         return True
-    if re.search(r"\.(tsv|csv|json|jsonl|txt)\b", text.lower()):
+    if _SUPPORTED_SAMPLE_FILE_EXTENSION_PATTERN.search(text):
         return True
     return False
 

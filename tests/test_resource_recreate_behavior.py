@@ -112,7 +112,7 @@ def test_create_index_recreates_when_replace_enabled(monkeypatch):
     monkeypatch.setattr(
         tools,
         "get_sample_docs_payload",
-        lambda limit=200: [{"isAdult": "0", "title": "Carmencita"}],
+        lambda limit=200, sample_doc_json="", source_local_file="": [{"isAdult": "0", "title": "Carmencita"}],
     )
 
     response = tools.create_index("imdb_titles", _create_body("keyword"), replace_if_exists=True)

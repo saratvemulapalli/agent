@@ -82,7 +82,7 @@ def test_create_index_fails_for_boolean_mapping_with_string_binary_flags(monkeyp
     monkeypatch.setattr(
         tools,
         "get_sample_docs_payload",
-        lambda limit=200: [{"isAdult": "0", "title": "Carmencita"}],
+        lambda limit=200, sample_doc_json="", source_local_file="": [{"isAdult": "0", "title": "Carmencita"}],
     )
 
     response = tools.create_index("imdb_titles", _create_body("boolean"))
@@ -99,7 +99,7 @@ def test_create_index_succeeds_for_keyword_mapping_with_string_binary_flags(monk
     monkeypatch.setattr(
         tools,
         "get_sample_docs_payload",
-        lambda limit=200: [{"isAdult": "1", "title": "Carmencita"}],
+        lambda limit=200, sample_doc_json="", source_local_file="": [{"isAdult": "1", "title": "Carmencita"}],
     )
     monkeypatch.setattr(tools, "_create_client", lambda: fake_client)
 
@@ -115,7 +115,7 @@ def test_create_index_succeeds_for_boolean_mapping_with_native_booleans(monkeypa
     monkeypatch.setattr(
         tools,
         "get_sample_docs_payload",
-        lambda limit=200: [{"isAdult": True, "title": "Carmencita"}],
+        lambda limit=200, sample_doc_json="", source_local_file="": [{"isAdult": True, "title": "Carmencita"}],
     )
     monkeypatch.setattr(tools, "_create_client", lambda: fake_client)
 
@@ -130,7 +130,7 @@ def test_create_index_fails_for_mixed_boolean_and_string_binary_flag_samples(mon
     monkeypatch.setattr(
         tools,
         "get_sample_docs_payload",
-        lambda limit=200: [
+        lambda limit=200, sample_doc_json="", source_local_file="": [
             {"isAdult": True, "title": "A"},
             {"isAdult": "0", "title": "B"},
         ],
@@ -153,7 +153,7 @@ def test_create_index_existing_index_violation_is_error(monkeypatch):
     monkeypatch.setattr(
         tools,
         "get_sample_docs_payload",
-        lambda limit=200: [{"isAdult": "0", "title": "Carmencita"}],
+        lambda limit=200, sample_doc_json="", source_local_file="": [{"isAdult": "0", "title": "Carmencita"}],
     )
     monkeypatch.setattr(tools, "_create_client", lambda: fake_client)
 
@@ -167,7 +167,7 @@ def test_create_index_existing_index_violation_is_error(monkeypatch):
 def test_create_index_normalizes_hnsw_engine_when_missing(monkeypatch):
     fake_client = _FakeClient()
     monkeypatch.setattr(tools, "_create_client", lambda: fake_client)
-    monkeypatch.setattr(tools, "get_sample_docs_payload", lambda limit=200: [])
+    monkeypatch.setattr(tools, "get_sample_docs_payload", lambda limit=200, sample_doc_json="", source_local_file="": [])
 
     body = {
         "mappings": {
@@ -197,7 +197,7 @@ def test_create_index_normalizes_hnsw_engine_when_missing(monkeypatch):
 def test_create_index_rewrites_nmslib_engine_to_lucene_for_hnsw(monkeypatch):
     fake_client = _FakeClient()
     monkeypatch.setattr(tools, "_create_client", lambda: fake_client)
-    monkeypatch.setattr(tools, "get_sample_docs_payload", lambda limit=200: [])
+    monkeypatch.setattr(tools, "get_sample_docs_payload", lambda limit=200, sample_doc_json="", source_local_file="": [])
 
     body = {
         "mappings": {
@@ -227,15 +227,14 @@ def test_create_index_rewrites_nmslib_engine_to_lucene_for_hnsw(monkeypatch):
 
 
 def test_apply_verification_blocks_on_boolean_policy_conflict(monkeypatch):
-    tools._VERIFICATION_DOC_TRACKER.clear()
-    tools._SEARCH_UI_SUGGESTION_META_BY_INDEX.clear()
+    tools._search_ui.suggestion_meta_by_index.clear()
 
     fake_client = _FakeClient(mapping_response=_mapping_response("boolean"))
 
     monkeypatch.setattr(
         tools,
         "get_sample_docs_payload",
-        lambda limit=200: [{"isAdult": "0", "title": "Carmencita"}],
+        lambda limit=200, sample_doc_json="", source_local_file="": [{"isAdult": "0", "title": "Carmencita"}],
     )
     monkeypatch.setattr(tools, "_create_client", lambda: fake_client)
 
@@ -253,15 +252,14 @@ def test_apply_verification_blocks_on_boolean_policy_conflict(monkeypatch):
 
 
 def test_apply_verification_proceeds_with_keyword_mapping_for_string_binary_flags(monkeypatch):
-    tools._VERIFICATION_DOC_TRACKER.clear()
-    tools._SEARCH_UI_SUGGESTION_META_BY_INDEX.clear()
+    tools._search_ui.suggestion_meta_by_index.clear()
 
     fake_client = _FakeClient(mapping_response=_mapping_response("keyword"))
 
     monkeypatch.setattr(
         tools,
         "get_sample_docs_payload",
-        lambda limit=200: [{"isAdult": "1", "title": "Carmencita"}],
+        lambda limit=200, sample_doc_json="", source_local_file="": [{"isAdult": "1", "title": "Carmencita"}],
     )
     monkeypatch.setattr(tools, "_create_client", lambda: fake_client)
 

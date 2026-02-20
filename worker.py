@@ -1,20 +1,23 @@
 import json
 import re
+from pathlib import Path
 
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
 from scripts.opensearch_ops_tools import (
-    apply_capability_driven_verification,
-    create_index,
+    apply_capability_driven_verification as apply_capability_driven_verification_impl,
+    create_index as create_index_impl,
     create_and_attach_pipeline,
     create_bedrock_embedding_model,
     create_local_pretrained_model,
     delete_doc,
     launch_search_ui,
+    set_search_ui_suggestions,
 )
 from scripts.tools import search_opensearch_org
 from scripts.shared import (
+    SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX,
     mark_execution_completed,
     set_last_worker_context,
     set_last_worker_run_state,
@@ -38,7 +41,7 @@ Your goal is to execute the technical plan provided in the context.
     *   **Second**: Create the index with the correct settings and mappings.
     *   **Third**: Create the ingest pipeline and attach it to the index (this often requires models to be ready).
     *   **Third-A (Hybrid lexical+semantic only)**: Create and attach a search pipeline with normalization + combination weights for hybrid query score blending.
-    *   **Fourth (Capability + Verification)**: Call `apply_capability_driven_verification` using the full approved plan text and an explicit `index_name` (target index for this run). This step both parses `Search Capabilities` and indexes capability-selected verification docs.
+    *   **Fourth (Capability + Verification)**: Call `apply_capability_driven_verification` using the full approved plan text and an explicit `index_name` (target index for this run). This step both parses `Search Capabilities` and indexes capability-selected verification docs. The result dict contains `suggestion_meta` — pass it to `set_search_ui_suggestions` (as JSON) with the same `index_name` before launching the UI.
     *   **Fifth (UX Handoff)**: Launch the custom React Search Builder UI using `launch_search_ui` so users can run queries immediately.
     *   **Sixth (Cleanup policy)**: Do NOT delete verification docs automatically. Keep them for user testing and clearly mention cleanup happens only when user explicitly asks.
 3.  **Report**: Confirm successful execution of all steps.
@@ -48,14 +51,15 @@ Your goal is to execute the technical plan provided in the context.
 2. Always verify your work by indexing a sample document.
 3. Use `apply_capability_driven_verification` for verification ingestion in this workflow.
 4. Pipeline `field_map` source fields must exist in index mapping/sample schema. Do not assume a `text` field exists.
-5. If there is no suitable text-like source field for embeddings, do not force dense-vector ingestion; proceed with lexical-only setup and report that dense vector is optional/not required for this schema.
-6. `apply_capability_driven_verification` must run before `launch_search_ui` or `delete_doc`.
-7. If any step fails, mark that step as failed in the execution report and do not claim overall success.
-8. Lock-order hard stop: if one step fails, do not execute any later step.
-9. Producer-driven boolean typing policy is strict:
+5. Schema-only exception: if no suitable text-like source field exists for embeddings, skip embedding setup only for this schema mismatch.
+6. If model registration/deployment fails (especially with memory pressure), stop execution, mark `model_setup` as failed, and tell the user to reconnect Docker and retry. Do NOT continue with lexical-only fallback for this failure mode.
+7. `apply_capability_driven_verification` must run before `launch_search_ui` or `delete_doc`.
+8. If any step fails, mark that step as failed in the execution report and do not claim overall success.
+9. Lock-order hard stop: if one step fails, do not execute any later step.
+10. Producer-driven boolean typing policy is strict:
     - Use `boolean` mapping only when sample/producer values are native booleans.
     - If producer values are string flags such as '0'/'1', map as `keyword` (do not coerce to boolean).
-10. For `knn_vector` method definitions, always set `method.engine` explicitly.
+11. For `knn_vector` method definitions, always set `method.engine` explicitly.
     - Never use `nmslib` (deprecated).
     - For `hnsw`, prefer `lucene` unless the approved plan explicitly requires `faiss`.
     - For `ivf`, use `faiss`.
@@ -98,6 +102,64 @@ _ALLOWED_STEP_STATUS = {"success", "failed", "skipped"}
 _HYBRID_WEIGHT_PROFILE_PATTERN = re.compile(
     r"hybrid\s+weight\s+profile\s*:\s*(semantic-heavy|balanced|lexical-heavy)\b",
     re.IGNORECASE,
+)
+_LOCALHOST_SOURCE_POLICY_PATTERN = re.compile(
+    r"execution\s+policy\s*:\s*source\s+is\s+localhost\s+opensearch\s+index(?:\s+'([^']+)')?",
+    re.IGNORECASE,
+)
+_LOCALHOST_SAMPLE_STATUS_PATTERN = re.compile(
+    r"sample\s+document\s+loaded\s+from\s+localhost\s+opensearch\s+index\s+'([^']+)'",
+    re.IGNORECASE,
+)
+_LOCALHOST_SOURCE_LINE_PATTERN = re.compile(
+    r"(?:^|\n)[^\n]*?(?:\*\*)?\b(?:source|data\s+source)\b(?:\*\*)?\s*:\s*localhost\s+opensearch\s+index"
+    r"(?:\s+(?:'([^']+)'|\"([^\"]+)\"|`([^`]+)`|([A-Za-z0-9._-]+)))?",
+    re.IGNORECASE,
+)
+_LOCALHOST_SOURCE_INDEX_JSON_PATTERN = re.compile(
+    r'"source_index_name"\s*:\s*"([^"]+)"',
+    re.IGNORECASE,
+)
+_SOURCE_LOCAL_FILE_JSON_PATTERN = re.compile(
+    r'"source_local_file"\s*:\s*"([^"]+)"',
+    re.IGNORECASE,
+)
+_SOURCE_LOCAL_FILE_STATUS_PATTERN = re.compile(
+    r"sample\s+document\s+loaded\s+from\s+'([^']+)'",
+    re.IGNORECASE,
+)
+_SOURCE_LINE_PATTERN = re.compile(
+    r"(?:^|\n)[^\n]*?(?:\*\*)?\bsource\b(?:\*\*)?\s*:\s*([^\n]+)",
+    re.IGNORECASE,
+)
+_SOURCE_LOCAL_FILE_TOKEN_PATTERN = re.compile(
+    rf"[^\s,;]+(?:{SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX})\b",
+    re.IGNORECASE,
+)
+_SAMPLE_DOC_LINE_PATTERN = re.compile(
+    r"(?:^|\n)\s*(?:[-*]\s*)?(?:\*\*)?\s*sample\s+doc(?:ument)?(?:\s+(?:structure|schema))?\s*(?:\*\*)?\s*:\s*(\{.*\})\s*(?=\n|$)",
+    re.IGNORECASE,
+)
+_MODEL_FAILURE_TOKENS = (
+    "model deployment failed",
+    "model deployment has failed",
+    "model registration failed",
+    "model registration has failed",
+    "model setup failed",
+)
+_MODEL_MEMORY_FAILURE_TOKENS = (
+    "memory constraints",
+    "memory constraint",
+    "native memory",
+    "out of memory",
+    "outofmemory",
+    "circuit_breaking_exception",
+    "ml_commons.native_memory_threshold",
+)
+_DOCKER_RECONNECT_GUIDANCE = (
+    "Execution halted: model setup failed due to OpenSearch memory pressure. "
+    "Please reconnect Docker (restart Docker Desktop/service) and retry this run. "
+    "Lexical-only fallback is disabled for this failure mode."
 )
 
 
@@ -158,6 +220,134 @@ def _resolve_hybrid_search_pipeline_weights(context: str) -> tuple[bool, list[fl
     if profile in profile_map:
         return True, profile_map[profile], profile
     return True, profile_map["balanced"], "balanced"
+
+
+def _resolve_localhost_source_protection(context: str) -> tuple[bool, str]:
+    """Detect whether sample data came from a localhost OpenSearch index.
+
+    Tries four patterns in priority order: an explicit execution-policy line,
+    a sample-document-loaded status message, a generic "Source: localhost OpenSearch index ..."
+    line, and a JSON ``source_index_name`` field.
+    Returns (is_localhost_source, source_index_name). When True, the source index
+    should be protected from being overwritten by the worker.
+    """
+    text = context or ""
+
+    policy_match = _LOCALHOST_SOURCE_POLICY_PATTERN.search(text)
+    if policy_match:
+        index_name = str(policy_match.group(1) or "").strip()
+        return True, index_name
+
+    status_match = _LOCALHOST_SAMPLE_STATUS_PATTERN.search(text)
+    if status_match:
+        index_name = str(status_match.group(1) or "").strip()
+        return True, index_name
+
+    source_line_match = _LOCALHOST_SOURCE_LINE_PATTERN.search(text)
+    if source_line_match:
+        index_name = str(
+            source_line_match.group(1)
+            or source_line_match.group(2)
+            or source_line_match.group(3)
+            or source_line_match.group(4)
+            or ""
+        ).strip()
+        return True, index_name
+
+    lowered = text.lower()
+    if '"source_localhost_index": true' in lowered:
+        json_match = _LOCALHOST_SOURCE_INDEX_JSON_PATTERN.search(text)
+        if json_match:
+            return True, str(json_match.group(1) or "").strip()
+        return True, ""
+
+    return False, ""
+
+
+def _resolve_source_local_file(context: str) -> str:
+    """Extract local sample-file path hints from execution context when available."""
+    text = context or ""
+
+    def _clean_path_candidate(raw_value: str) -> str:
+        candidate = str(raw_value or "").strip().strip("'\"`")
+        candidate = candidate.lstrip("([{<")
+        candidate = candidate.rstrip(")]}>.,;!?")
+        if not candidate:
+            return ""
+        lowered = candidate.lower()
+        if lowered.startswith("http://") or lowered.startswith("https://"):
+            return ""
+        # Keep Windows drive paths (e.g., C:\data\sample.parquet) but reject URL-like tokens.
+        if "://" in candidate and not re.match(r"^[A-Za-z]:[\\/]", candidate):
+            return ""
+        if not re.search(
+            rf"(?:{SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX})\b",
+            candidate,
+            flags=re.IGNORECASE,
+        ):
+            return ""
+        return candidate
+
+    def _find_path_token(haystack: str) -> str:
+        for token_match in _SOURCE_LOCAL_FILE_TOKEN_PATTERN.finditer(haystack):
+            candidate = _clean_path_candidate(token_match.group(0))
+            if candidate:
+                return candidate
+        return ""
+
+    json_match = _SOURCE_LOCAL_FILE_JSON_PATTERN.search(text)
+    if json_match:
+        candidate = _clean_path_candidate(str(json_match.group(1) or ""))
+        if candidate:
+            return candidate
+
+    status_match = _SOURCE_LOCAL_FILE_STATUS_PATTERN.search(text)
+    if status_match:
+        candidate = _clean_path_candidate(str(status_match.group(1) or ""))
+        if candidate:
+            return candidate
+
+    for source_match in _SOURCE_LINE_PATTERN.finditer(text):
+        candidate = _find_path_token(str(source_match.group(1) or ""))
+        if candidate:
+            return candidate
+
+    candidate = _find_path_token(text)
+    if candidate:
+        return candidate
+
+    if "scripts/sample_data/imdb.title.basics.tsv" in text:
+        return "scripts/sample_data/imdb.title.basics.tsv"
+
+    return ""
+
+
+def _extract_sample_doc_json(context: str) -> str:
+    text = context or ""
+
+    for line_match in _SAMPLE_DOC_LINE_PATTERN.finditer(text):
+        raw_json = str(line_match.group(1) or "").strip()
+        if not raw_json:
+            continue
+        try:
+            parsed = json.loads(raw_json)
+        except Exception:
+            continue
+        if isinstance(parsed, dict):
+            return json.dumps({"sample_doc": parsed}, ensure_ascii=False)
+
+    sample_doc_marker = re.search(r'"sample_doc"\s*:\s*', text, re.IGNORECASE)
+    if sample_doc_marker:
+        start = text.find("{", sample_doc_marker.end())
+        if start >= 0:
+            decoder = json.JSONDecoder()
+            try:
+                parsed_value, _ = decoder.raw_decode(text[start:])
+            except Exception:
+                parsed_value = None
+            if isinstance(parsed_value, dict):
+                return json.dumps({"sample_doc": parsed_value}, ensure_ascii=False)
+    return ""
 
 
 def _has_canonical_search_capabilities(context: str) -> bool:
@@ -329,6 +519,36 @@ def _store_worker_run_state(execution_context: str, report: dict, report_raw: st
         previous_attempt = 0
     attempt = previous_attempt + 1 if previous_context == execution_context else 1
 
+    source_local_file = _resolve_source_local_file(execution_context)
+    source_local_file = str(source_local_file or "").strip()
+    previous_source_local_file = (
+        str(previous_state.get("source_local_file", "")).strip()
+        if isinstance(previous_state, dict)
+        else ""
+    )
+    if not source_local_file:
+        source_local_file = previous_source_local_file
+
+    has_localhost_source, source_index_name = _resolve_localhost_source_protection(execution_context)
+    source_index_name = str(source_index_name or "").strip() if has_localhost_source else ""
+    previous_source_index_name = (
+        str(previous_state.get("source_index_name", "")).strip()
+        if isinstance(previous_state, dict)
+        else ""
+    )
+    if not source_index_name:
+        source_index_name = previous_source_index_name
+
+    sample_doc_json = _extract_sample_doc_json(execution_context)
+    sample_doc_json = str(sample_doc_json or "").strip()
+    previous_sample_doc_json = (
+        str(previous_state.get("sample_doc_json", "")).strip()
+        if isinstance(previous_state, dict)
+        else ""
+    )
+    if not sample_doc_json:
+        sample_doc_json = previous_sample_doc_json
+
     set_last_worker_context(execution_context)
     set_last_worker_run_state(
         {
@@ -338,8 +558,49 @@ def _store_worker_run_state(execution_context: str, report: dict, report_raw: st
             "last_report_raw": report_raw,
             "attempt": attempt,
             "status": report.get("status", "failed"),
+            "source_local_file": source_local_file,
+            "source_index_name": source_index_name,
+            "sample_doc_json": sample_doc_json,
         }
     )
+
+
+def _resolve_resume_source_defaults(previous_state: dict | None) -> tuple[str, str, str]:
+    """Extract checkpointed source defaults used for resume fallback."""
+    if not isinstance(previous_state, dict):
+        return "", "", ""
+    source_local_file = str(previous_state.get("source_local_file", "")).strip()
+    source_index_name = str(previous_state.get("source_index_name", "")).strip()
+    sample_doc_json = str(previous_state.get("sample_doc_json", "")).strip()
+    return source_local_file, source_index_name, sample_doc_json
+
+
+def _contains_model_memory_failure(response_text: str) -> bool:
+    lowered = (response_text or "").lower()
+    has_model_failure = any(token in lowered for token in _MODEL_FAILURE_TOKENS)
+    has_memory_failure = any(token in lowered for token in _MODEL_MEMORY_FAILURE_TOKENS)
+    return has_model_failure and has_memory_failure
+
+
+def _enforce_model_setup_failure_policy(response_text: str, report: dict) -> tuple[str, dict]:
+    normalized_response = str(response_text or "")
+    normalized_report = dict(report) if isinstance(report, dict) else _build_fallback_failed_report(
+        "Worker response missing normalized execution report.",
+        failed_step="unknown",
+    )
+
+    if _contains_model_memory_failure(normalized_response):
+        normalized_report = _build_fallback_failed_report(
+            "Model setup failed due to OpenSearch memory pressure. Reconnect Docker and retry. "
+            "Lexical-only fallback is disabled for this failure mode.",
+            failed_step="model_setup",
+        )
+
+    if str(normalized_report.get("failed_step", "")).strip().lower() == "model_setup":
+        if "reconnect docker" not in normalized_response.lower():
+            normalized_response = normalized_response.rstrip() + "\n\n" + _DOCKER_RECONNECT_GUIDANCE
+
+    return normalized_response, normalized_report
 
 
 def _finalize_worker_response(response_text: str, execution_context: str, report: dict) -> str:
@@ -369,8 +630,16 @@ def worker_agent(context: str) -> str:
         previous_state = get_last_worker_run_state() if resume_mode else {}
         resume_step = ""
         previous_steps: dict[str, str] = {}
+        checkpoint_source_local_file = ""
+        checkpoint_source_index_name = ""
+        checkpoint_sample_doc_json = ""
 
         if resume_mode:
+            (
+                checkpoint_source_local_file,
+                checkpoint_source_index_name,
+                checkpoint_sample_doc_json,
+            ) = _resolve_resume_source_defaults(previous_state)
             if not execution_context and isinstance(previous_state, dict):
                 execution_context = str(previous_state.get("context", "")).strip()
             resume_step = str(previous_state.get("failed_step", "")).strip() if isinstance(previous_state, dict) else ""
@@ -406,6 +675,9 @@ def worker_agent(context: str) -> str:
         requires_hybrid_search_pipeline, hybrid_weights, hybrid_profile = _resolve_hybrid_search_pipeline_weights(
             execution_context
         )
+        protect_localhost_source, localhost_source_index_name = _resolve_localhost_source_protection(
+            execution_context
+        )
 
         model = BedrockModel(
             model_id=model_id,
@@ -417,19 +689,105 @@ def worker_agent(context: str) -> str:
                 }
             }
         )
+
+        default_source_index_name = (
+            str(localhost_source_index_name).strip()
+            if protect_localhost_source and localhost_source_index_name
+            else ""
+        )
+        if not default_source_index_name:
+            default_source_index_name = checkpoint_source_index_name
+        inferred_source_local_file = _resolve_source_local_file(execution_context)
+        if not inferred_source_local_file:
+            inferred_source_local_file = checkpoint_source_local_file
+        default_source_local_file = ""
+        if inferred_source_local_file:
+            candidate_path = Path(inferred_source_local_file).expanduser()
+            if candidate_path.exists() and candidate_path.is_file():
+                default_source_local_file = str(candidate_path)
+            elif inferred_source_local_file == "scripts/sample_data/imdb.title.basics.tsv":
+                # Keep workspace-relative built-in sample path for portable runs.
+                default_source_local_file = inferred_source_local_file
+            else:
+                default_source_local_file = inferred_source_local_file
+        default_sample_doc_json = _extract_sample_doc_json(execution_context)
+        if not default_sample_doc_json:
+            default_sample_doc_json = checkpoint_sample_doc_json
+
+        def create_index(
+            index_name: str,
+            body: dict = None,
+            replace_if_exists: bool = True,
+            sample_doc_json: str = "",
+            source_local_file: str = "",
+            source_index_name: str = "",
+        ) -> str:
+            """Create an index; protect the localhost source index from being overwritten."""
+            effective_replace = bool(replace_if_exists)
+            if protect_localhost_source:
+                effective_replace = False
+            effective_source_index = str(source_index_name or "").strip() or default_source_index_name
+            effective_source_local_file = str(source_local_file or "").strip() or default_source_local_file
+            effective_sample_doc_json = str(sample_doc_json or "").strip() or default_sample_doc_json
+
+            return create_index_impl(
+                index_name=index_name,
+                body=body,
+                replace_if_exists=effective_replace,
+                sample_doc_json=effective_sample_doc_json,
+                source_local_file=effective_source_local_file,
+                source_index_name=effective_source_index,
+            )
+
+        def apply_capability_driven_verification(
+            worker_output: str,
+            index_name: str = "",
+            count: int = 10,
+            id_prefix: str = "verification",
+            sample_doc_json: str = "",
+            source_local_file: str = "",
+            source_index_name: str = "",
+            existing_verification_doc_ids: str = "",
+        ) -> dict[str, object]:
+            effective_source_index = str(source_index_name or "").strip() or default_source_index_name
+            effective_source_local_file = str(source_local_file or "").strip() or default_source_local_file
+            effective_sample_doc_json = str(sample_doc_json or "").strip() or default_sample_doc_json
+            if not effective_source_index:
+                _, inferred_source_index = _resolve_localhost_source_protection(worker_output)
+                effective_source_index = str(inferred_source_index or "").strip()
+            if not effective_source_index:
+                effective_source_index = checkpoint_source_index_name
+            if not effective_sample_doc_json:
+                inferred_sample_doc_json = _extract_sample_doc_json(worker_output)
+                effective_sample_doc_json = str(inferred_sample_doc_json or "").strip()
+            if not effective_source_local_file:
+                effective_source_local_file = checkpoint_source_local_file
+            if not effective_sample_doc_json:
+                effective_sample_doc_json = checkpoint_sample_doc_json
+            return apply_capability_driven_verification_impl(
+                worker_output=worker_output,
+                index_name=index_name,
+                count=count,
+                id_prefix=id_prefix,
+                sample_doc_json=effective_sample_doc_json,
+                source_local_file=effective_source_local_file,
+                source_index_name=effective_source_index,
+                existing_verification_doc_ids=existing_verification_doc_ids,
+            )
         
         agent = Agent(
             model=model,
             system_prompt=SYSTEM_PROMPT,
             tools=[
-                create_index,
-                search_opensearch_org,
-                create_and_attach_pipeline,
-                apply_capability_driven_verification,
-                create_bedrock_embedding_model,
-                create_local_pretrained_model,
-                launch_search_ui,
-                delete_doc,
+                tool(create_index),
+                tool(search_opensearch_org),
+                tool(create_and_attach_pipeline),
+                tool(apply_capability_driven_verification),
+                tool(create_bedrock_embedding_model),
+                tool(create_local_pretrained_model),
+                tool(launch_search_ui),
+                tool(delete_doc),
+                tool(set_search_ui_suggestions),
             ],
             callback_handler=ThinkingCallbackHandler(output_color="\033[92m") # Green for worker
         )
@@ -441,6 +799,7 @@ def worker_agent(context: str) -> str:
             "- Call apply_capability_driven_verification with worker_output set to the full approved plan text above and explicit index_name for this run.\n"
             "- This call also indexes capability-selected verification docs (count=10 by default).\n"
             "- Do not omit index_name in that call.\n"
+            "- The result contains a 'suggestion_meta' list. Pass it as JSON to set_search_ui_suggestions(index_name, suggestion_meta_json) before launching the UI.\n"
             "- Continue even if capability coverage is partial; capture any notes in your final report.\n"
             "Verification requirements:\n"
             "- Keep verification docs for interactive testing.\n"
@@ -452,13 +811,22 @@ def worker_agent(context: str) -> str:
             "Schema alignment requirements:\n"
             "- Use only existing source fields from sample/index mapping for pipeline field_map.\n"
             "- Do not invent a `text` source field if it does not exist.\n"
-            "- If no suitable source field exists for embeddings, skip embedding pipeline/model and continue with lexical indexing.\n"
+            "- Schema-only exception: if no suitable source field exists for embeddings, skip embedding setup only for this schema mismatch.\n"
+            "- If model creation/deployment fails (especially due to memory pressure), stop execution, mark model_setup as failed, and ask the user to reconnect Docker and retry.\n"
+            "- Do NOT continue with lexical-only fallback after model creation/deployment failures.\n"
             "- Enforce producer-driven boolean typing: map fields as boolean only for native booleans; map string flags ('0'/'1') as keyword.\n"
             "Mandatory final output:\n"
             "- End your response with exactly one <execution_report> JSON block with canonical step IDs and statuses.\n"
             "- If any step fails, set status='failed' and set failed_step to the earliest failed canonical step.\n"
             "- Lock-order hard stop: do not execute any later step after the first failed step."
         )
+        if protect_localhost_source and localhost_source_index_name:
+            instruction += (
+                "\nLocalhost source policy:\n"
+                f"- Sample source is localhost OpenSearch index '{localhost_source_index_name}'.\n"
+                "- Do NOT recreate this index (replace_if_exists=false). "
+                "Choose a different target index name to avoid overwriting the source data.\n"
+            )
         if requires_hybrid_search_pipeline:
             instruction += (
                 "\nHybrid lexical+semantic pipeline requirements:\n"
@@ -499,6 +867,8 @@ def worker_agent(context: str) -> str:
 
         if resume_mode:
             normalized_report = _merge_resume_progress(normalized_report, previous_steps, resume_step)
+
+        response_text, normalized_report = _enforce_model_setup_failure_policy(response_text, normalized_report)
 
         return _finalize_worker_response(response_text, execution_context, normalized_report)
 

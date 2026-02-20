@@ -1,18 +1,24 @@
 import asyncio
+import json
+import re
+from dataclasses import dataclass, field
 
-from strands import Agent
+from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
 from scripts.tools import (
     submit_sample_doc,
-    get_sample_doc,
     submit_sample_doc_from_local_file,
+    submit_sample_doc_from_localhost_index,
     submit_sample_doc_from_url,
-    clear_sample_doc,
 )
 from scripts.shared import (
     Phase,
+    SUPPORTED_SAMPLE_FILE_FORMATS_COMMA,
+    SUPPORTED_SAMPLE_FILE_FORMATS_MARKDOWN,
+    SUPPORTED_SAMPLE_FILE_FORMATS_SLASH,
     read_multiline_input,
+    read_single_choice_input,
     check_and_clear_execution_flag,
     looks_like_new_request,
     looks_like_cancel,
@@ -20,20 +26,28 @@ from scripts.shared import (
     looks_like_worker_retry,
     looks_like_url_message,
     looks_like_local_path_message,
+    looks_like_localhost_index_message,
+    looks_like_builtin_imdb_sample_request,
     clear_last_worker_context,
     clear_last_worker_run_state,
     get_last_worker_run_state,
 )
 from scripts.opensearch_ops_tools import cleanup_verification_docs
 from solution_planning_assistant import solution_planning_assistant, reset_planner_agent
-from worker import worker_agent
+from worker import (
+    worker_agent as worker_agent_impl,
+    _extract_sample_doc_json as worker_extract_sample_doc_json,
+    _resolve_localhost_source_protection as worker_resolve_localhost_source_protection,
+    _resolve_source_local_file as worker_resolve_source_local_file,
+)
 
 
 # -------------------------------------------------------------------------
 # System Prompt
 # -------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """
+SYSTEM_PROMPT = (
+    """
 You are an intelligent Orchestrator Agent for an OpenSearch Solution Architect system.
 
 Your goal is to guide the user from initial requirements to a finalized, executed solution.
@@ -43,24 +57,60 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 1.  **Collect Sample Document (Mandatory First Step)**:
     *   A sample document is required before any planning or execution.
     *   **Pre-loaded samples (highest priority)**: If the user message contains a
-        "System note" stating a sample document has already been loaded, trust it.
-        Call `get_sample_doc` immediately and proceed to Phase 2. Do NOT ask the
-        user to paste content or re-upload — the sample is already stored.
+        "System note" stating a sample document has already been loaded, trust it
+        and proceed to Phase 2. Do NOT ask the user to paste content or re-upload.
+    *   Supported sample sources:
+    *   `1` Built-in IMDb sample file: `scripts/sample_data/imdb.title.basics.tsv`
+    *   `2` User-provided local path or URL
+    *       Supported formats: __SUPPORTED_SAMPLE_FILE_FORMATS_MARKDOWN__
+    *       Example: `/path/to/your/data.json` or `https://example.com/sample.json`
+    *   `3` Existing localhost OpenSearch index
+    *       If option 3 is selected without a valid index name, list current
+        non-system localhost indices and ask the user to select one.
+    *   `4` Paste sample content directly (preferably JSON records)
+    *       Paste 1-3 representative JSON records, for example:
+    *       `{"id":"1","title":"Example A","description":"Sample text A","category":"demo"}`
+    *       `{"id":"2","title":"Example B","description":"Sample text B","category":"demo"}`
     *   If the user pastes sample content, call `submit_sample_doc`.
-    *   If no sample is available, ask the user to paste one sample document.
+    *   If no sample is available yet, ask the user once to choose one of the 4 options above.
     *   Do not skip this step.
 
 2.  **Clarify Requirements**:
     *   Based on your analysis of the sample doc, engage the user only **once** to gather REMAINING critical information.
-    *   **Infer First**: If sample was loaded from URL/local source, use inferred metadata from tool output before asking questions.
-    *   **Document Size**: Infer approximate size from source/profile when possible. Ask follow-up to confirm whether provided file/folder is the full corpus or only a sample, and expected future growth.
-    *   **Languages**: Infer likely language/script from sample data first. Ask whether future/new datasets will include additional languages and whether cross-lingual search is required.
-    *   **Budget/Cost**: Is there a strict budget? Is cost-effective search required?
-    *   **Latency Requirements**: What is the target P99 latency?
-    *   **Latency-Accuracy Trade-off**: What is the desired trade-off between latency and accuracy?
-    *   **Hybrid Weight Preference (only if hybrid is being considered)**: Ask one explicit choice for lexical-vs-semantic emphasis: `semantic-heavy`, `balanced`, or `lexical-heavy`.
-    *   **Model Deployment**: SageMaker GPU endpoint, embedding API service, OpenSearch Node deployment, custom model deployment, etc.?
-    *   **Special Requirements**: Any special requirements? (e.g., prefix queries, wildcard support, etc.)
+    *   **Infer First**: If sample was loaded from URL/local source/localhost index, use inferred metadata from tool output before asking questions.
+    *   **Document Size**: Infer approximate size from source/profile when possible. Default assumption: the loaded data is a representative sample and production data will continue to grow. Do NOT ask whether the source is complete, and do NOT ask growth-projection questions unless the user explicitly asks for capacity sizing.
+    *   **Languages**: Infer likely language/script directly from sample data and treat sample/schema language coverage as final truth for planning. Do NOT ask about future additional languages or future cross-lingual needs unless the user explicitly asks for multilingual expansion.
+    *   **Budget/Cost**: Use a single-choice selection with exactly two options: `flexible` or `cost-sensitive`. Do NOT ask open-ended free-text budget questions.
+    *   **Performance vs Accuracy Priority**: Use a single-choice selection with exactly three options: `speed-first`, `balanced`, `accuracy-first`. Do NOT ask explicit response-time/P99 targets unless the user explicitly requests SLA-driven tuning.
+    *   **Semantic Search Query-Pattern Preference (pre-planning)**: If text-based search is in scope, ask this once during requirement clarification before calling `solution_planning_assistant`.
+        Use a fixed three-option query-pattern choice:
+        - Queries are mostly exact / navigational (IDs, names, short queries)
+        - Balanced (default)
+        - Queries are mostly natural language / semantic
+        If pre-processing already provided either
+        `Requirements note: semantic query-pattern preference = ...` or `Hybrid Weight Profile: ...`,
+        treat query-pattern preference as already collected and do NOT ask again.
+    *   **Natural-Language / Concept Search Scope**: Use semantic query-pattern preference to determine emphasis.
+        If query pattern is semantic-dominant, treat natural-language/concept retrieval as a primary requirement.
+        Do NOT ask a separate yes/no confirmation question.
+    *   **Mapping-Clarity Assumption**: Do NOT ask whether mapping guidance is clear (including `isAdult` typing guidance). Assume users will raise concerns if needed.
+    *   **Semantic Expansion Explanation Assumption**: Assume no proactive deep-dive explanation is desired. Do NOT ask whether the user wants more semantic-expansion explanation unless the user explicitly asks for details.
+    *   **Model Deployment (Production)**: OpenSearch node, SageMaker endpoint, and external embedding API deployments are all valid.
+        Ask the deployment-preference question only when the selected query pattern is semantic-dominant
+        (mostly natural language / semantic).
+    *   **Launch UI Execution Scope**: Launch UI setup provisions only local OpenSearch-hosted pretrained models (dense or sparse).
+        Treat this as tooling scope, not as a user rejection of SageMaker/external APIs.
+    *   **Query Features (Conditional Prefix/Wildcard)**: Assume range queries and aggregations/facets are required by default. Include geospatial search only when lat/lon fields exist in the sample/schema.
+        Assume prefix/wildcard matching is not required unless the user explicitly asks for it.
+        Prefix/wildcard matching implies lexical BM25 capability.
+    *   **Search Use Cases (Default Assumption)**: Do NOT ask a specific-use-cases checklist. Assume core use cases are required: range/filter retrieval, aggregation analytics, and pattern/trend analysis.
+    *   **Additional Requirements Defaults (Do Not Ask)**:
+        - Keep query/filter/aggregation capabilities only when supported by the sample/schema fields; skip unsupported capabilities.
+        - Assume no specific dashboard or visualization requirement unless explicitly requested.
+        - Assume real-time ingestion/search is required unless the user explicitly asks for batch-only behavior.
+        - Assume no additional custom requirements unless the user explicitly provides them.
+        - Do NOT ask checklist follow-up questions for these defaults.
+    *   **Text Search Inference**: Determine text-search need by field analysis: if any field is suitable for non-keyword full-text/semantic retrieval, treat it as "yes, text-based search is needed."
     
     Only prompt the user **once** for these details. 
     Even there are missing information, do not repeatedly request in separate turns. Do proper assumptions from sample data and provided information.
@@ -90,9 +140,30 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 *   **Worker Call**: You MUST call `worker_agent` immediately after the planning phase completes.
 *   **Sample Doc Gate**: A sample document must exist before clarification/planning. When the message says a sample is pre-loaded, proceed directly — do not re-collect.
 *   **No Redundant Questions**: Do not ask users to restate values already inferred from source profile/sample data. Only ask confirmation or forward-looking deltas.
+*   **Performance Question Scope**: Do not ask a separate numeric latency-target question. Use only the speed-vs-accuracy priority question unless the user explicitly asks for P99/SLA tuning.
+*   **Multiple-Choice Clarifications**: For budget, performance priority, semantic-search query-pattern preference (before solution planning when text-based search is in scope), and production model deployment preference (only when the query-pattern preference is semantic-dominant), use fixed option selection format, not free-text prompts.
+*   **Pre-Collected Query Pattern**: If `Requirements note: semantic query-pattern preference = ...` or `Hybrid Weight Profile: ...` appears in system context, query-pattern preference is already resolved. Do not ask a duplicate query-pattern question.
+*   **Default Query Features**: Treat range queries and aggregations/facets as required baseline capabilities. Geospatial is conditional: include only if lat/lon fields exist in sample/schema.
+*   **Prefix/Wildcard Scope**: Do NOT ask a clarification question for prefix/wildcard matching. Assume it is disabled unless the user explicitly requests it. If enabled, treat lexical BM25 capability as required. If disabled, do not force BM25 solely for prefix/wildcard support.
+*   **Hybrid Method Limit**: If hybrid retrieval is used, limit to two retrieval methods. Do NOT propose three-way hybrids such as sparse + BM25 + dense.
+*   **No Query-Pattern Checklist**: Do not ask example-style query-pattern questions when sample/schema is available. Infer directly.
+*   **Default Specific Use Cases**: Assume yes for core use cases (range/filter retrieval, aggregation analytics, and pattern/trend analysis). Do not ask a separate specific-use-cases checklist.
+*   **Additional Requirements Defaults**: Assume keep-if-supported query capability handling, no dashboard/visualization requirement, real-time ingestion/search required, and no extra custom requirements unless the user explicitly asks/provides them. Do not ask follow-up checklist questions for these defaults.
+*   **Text Search Decision Rule**: If sample/schema includes any non-keyword text field suitable for semantic/full-text search, classify as "yes, text-based search is needed."
+*   **Natural-Language/Concept Search Rule**: Use the selected semantic query pattern to set priority. If semantic-dominant, treat natural-language/concept retrieval as primary. Do not ask a separate confirmation question.
+*   **Mapping Clarity Rule**: Do not ask "is mapping guidance clear?" style questions (including `isAdult` mapping clarity checks). Assume users will raise concerns if they have any.
+*   **Sample Final-Truth Rule**: Treat the provided sample/schema as final truth. Do not ask whether future text-heavy fields will be added, and do not ask future multilingual/cross-lingual expectation questions.
+*   **Semantic Expansion Explanation Assumption**: Assume no proactive deep-dive explanation preference. Do not ask whether the user wants more semantic-expansion explanation unless they explicitly request it.
+*   **Deployment Scope**: For planning, allow OpenSearch node, SageMaker, or external embedding API deployment preferences.
+    For Launch UI execution, local OpenSearch-hosted pretrained models are the supported setup path.
 *   **Producer-Driven Typing**: Reinforce strict schema typing in planning/execution context: map `boolean` only when producer sends native booleans; if producer sends string flags like `0`/`1`, map as `keyword`.
 *   **Persona**: You are the interface; be helpful, polite, and professional.
 """
+    .replace(
+        "__SUPPORTED_SAMPLE_FILE_FORMATS_MARKDOWN__",
+        SUPPORTED_SAMPLE_FILE_FORMATS_MARKDOWN,
+    )
+)
 
 
 # -------------------------------------------------------------------------
@@ -100,13 +171,728 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 # -------------------------------------------------------------------------
 
 MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+BUILTIN_IMDB_SAMPLE_PATH = "scripts/sample_data/imdb.title.basics.tsv"
+
+
+# -------------------------------------------------------------------------
+# Local sample-doc state (replaces the former globals in scripts/tools.py)
+# -------------------------------------------------------------------------
+
+_RESUME_WORKER_MARKER = "[RESUME_WORKER_FROM_FAILED_STEP]"
+_SYSTEM_SOURCE_CONTEXT_HEADER = "[SYSTEM SOURCE CONTEXT]"
+
+
+@dataclass
+class SessionState:
+    sample_doc_json: str | None = None
+    source_local_file: str | None = None
+    source_index_name: str | None = None
+    source_index_doc_count: int | None = None
+    inferred_text_search_required: bool | None = None
+    inferred_semantic_text_fields: list[str] = field(default_factory=list)
+    budget_preference: str | None = None
+    performance_priority: str | None = None
+    model_deployment_preference: str | None = None
+    prefix_wildcard_enabled: bool | None = None
+    hybrid_weight_profile: str | None = None
+    pending_localhost_index_options: list[str] = field(default_factory=list)
+
+_NUMERIC_STRING_PATTERN = re.compile(r"[+-]?\d+(\.\d+)?")
+_DATEISH_STRING_PATTERN = re.compile(
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}"
+    r"(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?"
+)
+_EXCLUDED_TEXT_FIELD_NAME_TOKENS = {
+    "id",
+    "uuid",
+    "guid",
+    "code",
+    "zip",
+    "postal",
+    "lat",
+    "lon",
+    "lng",
+    "latitude",
+    "longitude",
+}
+
+_DEFAULT_QUERY_FEATURES_NOTE = (
+    "Requirements note: default query features are required: range queries "
+    "and aggregations/facets. "
+    "Geospatial is conditional: include only when lat/lon fields exist in sample/schema. "
+    "Do NOT ask the user to confirm these defaults."
+)
+_MODEL_DEPLOYMENT_SCOPE_NOTE = (
+    "Requirements note: production model deployment options include OpenSearch node, SageMaker endpoint, "
+    "and external embedding APIs. If semantic retrieval is used, capture/reflect the preferred production deployment mode. "
+    "Execution policy: Launch UI setup provisions local OpenSearch-hosted pretrained models only "
+    "(dense or sparse) for bootstrap."
+)
+_PERFORMANCE_PRIORITY_SCOPE_NOTE = (
+    "Requirements note: performance clarification should use one question only: "
+    "speed-first, accuracy-first, or balanced. "
+    "Do NOT ask explicit numeric latency/P99 targets unless the user explicitly asks for SLA tuning."
+)
+_SAMPLE_FINAL_TRUTH_NOTE = (
+    "Requirements note: treat sample data/schema as final truth for planning. "
+    "Do NOT ask whether future text-heavy fields will be added, and do NOT ask future multilingual/cross-lingual expectation questions."
+)
+_SEMANTIC_EXPANSION_EXPLANATION_NOTE = (
+    "Requirements note: semantic expansion explanation preference = no proactive deep-dive. "
+    "Do NOT ask whether the user wants more semantic-expansion explanation unless they explicitly request details."
+)
+_NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE = (
+    "Requirements note: natural-language/concept-based retrieval should be treated as primary "
+    "because the semantic query pattern is semantic-dominant. "
+    "Do NOT ask a separate yes/no confirmation question."
+)
+_MAPPING_CLARITY_FEEDBACK_NOTE = (
+    "Requirements note: do NOT ask whether field-mapping guidance is clear (including isAdult typing). "
+    "Assume users will raise concerns if needed."
+)
+_DEFAULT_SPECIFIC_USE_CASES_NOTE = (
+    "Requirements note: default specific use cases are enabled. "
+    "Assume yes for range/filter retrieval, aggregation analytics, and pattern/trend analysis. "
+    "Do NOT ask a separate specific-use-cases checklist."
+)
+_DEFAULT_QUERY_SUPPORT_SCOPE_NOTE = (
+    "Requirements note: capability applicability should be data-backed. "
+    "If the sample/schema supports a query/filter/aggregation capability, keep it; otherwise skip it."
+)
+_DEFAULT_DASHBOARD_REQUIREMENT_NOTE = (
+    "Requirements note: dashboard/visualization requirement = none by default. "
+    "Assume no specific dashboard or visualization needs unless the user explicitly asks."
+)
+_DEFAULT_REALTIME_REQUIREMENT_NOTE = (
+    "Requirements note: real-time ingestion/search requirement = enabled by default. "
+    "Assume near real-time ingestion and search freshness are required unless the user explicitly requests batch-only."
+)
+_DEFAULT_CUSTOM_REQUIREMENTS_NOTE = (
+    "Requirements note: additional custom requirements = none by default unless user explicitly provides them. "
+    "Do NOT ask an open-ended additional-requirements checklist."
+)
+_BUDGET_PREFERENCE_NOTE_PREFIX = "Requirements note: budget preference ="
+_PERFORMANCE_PREFERENCE_NOTE_PREFIX = "Requirements note: performance priority ="
+_SEMANTIC_QUERY_PATTERN_PREFERENCE_NOTE_PREFIX = "Requirements note: semantic query-pattern preference ="
+_MODEL_DEPLOYMENT_PREFERENCE_NOTE_PREFIX = "Requirements note: production model deployment preference ="
+_HYBRID_WEIGHT_PROFILE_PREFIX = "Hybrid Weight Profile:"
+_BUDGET_OPTION_FLEXIBLE = "flexible"
+_BUDGET_OPTION_COST_SENSITIVE = "cost-sensitive"
+_PERFORMANCE_OPTION_SPEED = "speed-first"
+_PERFORMANCE_OPTION_BALANCED = "balanced"
+_PERFORMANCE_OPTION_ACCURACY = "accuracy-first"
+_MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE = "opensearch-node"
+_MODEL_DEPLOYMENT_OPTION_SAGEMAKER_ENDPOINT = "sagemaker-endpoint"
+_MODEL_DEPLOYMENT_OPTION_EXTERNAL_EMBEDDING_API = "external-embedding-api"
+_HYBRID_WEIGHT_OPTION_SEMANTIC = "semantic-heavy"
+_HYBRID_WEIGHT_OPTION_BALANCED = "balanced"
+_HYBRID_WEIGHT_OPTION_LEXICAL = "lexical-heavy"
+_QUERY_PATTERN_OPTION_MOSTLY_EXACT = "mostly-exact"
+_QUERY_PATTERN_OPTION_BALANCED = "balanced"
+_QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC = "mostly-semantic"
+_DEFAULT_QUERY_FEATURES_NOTE_PREFIX = "Requirements note: default query features are required:"
+_PREFIX_WILDCARD_REQUIREMENT_NOTE_PREFIX = "Requirements note: prefix/wildcard matching preference ="
+_TEXT_SEARCH_USE_CASE_NOTE_PREFIX = "Requirements note: inferred search use case ="
+_MODEL_DEPLOYMENT_SCOPE_NOTE_PREFIX = "Requirements note: production model deployment options include OpenSearch node, SageMaker endpoint, and external embedding APIs."
+_PERFORMANCE_PRIORITY_SCOPE_NOTE_PREFIX = "Requirements note: performance clarification should use one question only:"
+_SAMPLE_FINAL_TRUTH_NOTE_PREFIX = "Requirements note: treat sample data/schema as final truth for planning."
+_SEMANTIC_EXPANSION_EXPLANATION_NOTE_PREFIX = "Requirements note: semantic expansion explanation preference ="
+_NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE_PREFIX = "Requirements note: natural-language/concept-based retrieval should be treated as primary"
+_MAPPING_CLARITY_FEEDBACK_NOTE_PREFIX = "Requirements note: do NOT ask whether field-mapping guidance is clear"
+_DEFAULT_SPECIFIC_USE_CASES_NOTE_PREFIX = "Requirements note: default specific use cases are enabled."
+_DEFAULT_QUERY_SUPPORT_SCOPE_NOTE_PREFIX = "Requirements note: capability applicability should be data-backed."
+_DEFAULT_DASHBOARD_REQUIREMENT_NOTE_PREFIX = "Requirements note: dashboard/visualization requirement = none by default."
+_DEFAULT_REALTIME_REQUIREMENT_NOTE_PREFIX = "Requirements note: real-time ingestion/search requirement = enabled by default."
+_DEFAULT_CUSTOM_REQUIREMENTS_NOTE_PREFIX = "Requirements note: additional custom requirements = none by default"
+
+
+def _infer_budget_preference_from_text(text: str) -> str | None:
+    """Infer budget preference from free-form user text."""
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+
+    no_budget_signals = (
+        "no budget",
+        "no cost constraint",
+        "budget is flexible",
+        "flexible with costs",
+        "cost is not a concern",
+        "no budget constraints",
+        "no budget limitation",
+    )
+    if any(signal in lowered for signal in no_budget_signals):
+        return _BUDGET_OPTION_FLEXIBLE
+
+    cost_sensitive_signals = (
+        "budget constraint",
+        "cost-effective",
+        "cost sensitive",
+        "optimize cost",
+        "low cost",
+        "tight budget",
+        "budget limited",
+    )
+    if any(signal in lowered for signal in cost_sensitive_signals):
+        return _BUDGET_OPTION_COST_SENSITIVE
+    return None
+
+
+def _infer_performance_priority_from_text(text: str) -> str | None:
+    """Infer performance-vs-accuracy priority from free-form user text."""
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+
+    if "speed-first" in lowered:
+        return _PERFORMANCE_OPTION_SPEED
+    if "accuracy-first" in lowered:
+        return _PERFORMANCE_OPTION_ACCURACY
+    if "balanced" in lowered:
+        return _PERFORMANCE_OPTION_BALANCED
+
+    speed_signals = ("ultra-fast", "fast", "speed", "low latency", "latency first")
+    accuracy_signals = ("accuracy", "relevance", "precision", "quality first")
+
+    has_speed = any(signal in lowered for signal in speed_signals)
+    has_accuracy = any(signal in lowered for signal in accuracy_signals)
+    if has_speed and not has_accuracy:
+        return _PERFORMANCE_OPTION_SPEED
+    if has_accuracy and not has_speed:
+        return _PERFORMANCE_OPTION_ACCURACY
+    if has_speed and has_accuracy:
+        return _PERFORMANCE_OPTION_BALANCED
+    return None
+
+
+def _infer_prefix_wildcard_preference_from_text(text: str) -> bool | None:
+    """Infer explicit user intent for prefix/wildcard behavior."""
+    lowered = (text or "").lower()
+    if not lowered:
+        return None
+
+    negative_patterns = (
+        r"\b(?:do not|don't|dont|not)\s+(?:need|require|want|use|include|enable|support)\b[^.\n]{0,40}\b(?:prefix|wildcard)\b",
+        r"\b(?:no|without)\s+(?:prefix|wildcard)\b",
+        r"\bexact(?:\s+match(?:es)?)?\s+only\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in negative_patterns):
+        return False
+
+    positive_patterns = (
+        r"\b(?:need|require|want|use|include|enable|support)\b[^.\n]{0,40}\b(?:prefix|wildcard)\b",
+        r"\b(?:prefix|wildcard)\b[^.\n]{0,40}\b(?:needed|required|requested|enabled|supported)\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in positive_patterns):
+        return True
+    return None
+
+
+def _build_budget_preference_note(preference: str) -> str:
+    """Build canonical budget preference requirement note."""
+    if preference == _BUDGET_OPTION_COST_SENSITIVE:
+        return (
+            "Requirements note: budget preference = cost-sensitive. "
+            "Prioritize cost-effective architecture choices."
+        )
+    return (
+        "Requirements note: budget preference = flexible (no strict budget constraints). "
+        "Do not optimize primarily for cost."
+    )
+
+
+def _build_performance_preference_note(preference: str) -> str:
+    """Build canonical performance priority requirement note."""
+    if preference == _PERFORMANCE_OPTION_SPEED:
+        return (
+            "Requirements note: performance priority = speed-first. "
+            "Prefer lower-latency retrieval settings when trade-offs are required."
+        )
+    if preference == _PERFORMANCE_OPTION_ACCURACY:
+        return (
+            "Requirements note: performance priority = accuracy-first. "
+            "Prefer higher relevance/quality settings when trade-offs are required."
+        )
+    return (
+        "Requirements note: performance priority = balanced. "
+        "Use balanced speed-vs-relevance defaults."
+    )
+
+
+def _build_semantic_query_pattern_preference_note(profile: str) -> str:
+    """Build canonical semantic query-pattern requirement note from hybrid profile."""
+    normalized = str(profile or "").strip().lower()
+    if normalized == _HYBRID_WEIGHT_OPTION_LEXICAL:
+        return (
+            "Requirements note: semantic query-pattern preference = mostly exact / navigational. "
+            "This value is already collected; do NOT ask this query-pattern question again."
+        )
+    if normalized == _HYBRID_WEIGHT_OPTION_SEMANTIC:
+        return (
+            "Requirements note: semantic query-pattern preference = mostly natural language / semantic. "
+            "This value is already collected; do NOT ask this query-pattern question again."
+        )
+    return (
+        "Requirements note: semantic query-pattern preference = balanced. "
+        "This value is already collected; do NOT ask this query-pattern question again."
+    )
+
+
+def _build_model_deployment_preference_note(preference: str) -> str:
+    """Build canonical production semantic-model deployment preference note."""
+    normalized = str(preference or "").strip().lower()
+    if normalized == _MODEL_DEPLOYMENT_OPTION_SAGEMAKER_ENDPOINT:
+        return (
+            "Requirements note: production model deployment preference = SageMaker endpoint "
+            "(separate compute, more flexible scaling)."
+        )
+    if normalized == _MODEL_DEPLOYMENT_OPTION_EXTERNAL_EMBEDDING_API:
+        return (
+            "Requirements note: production model deployment preference = external embedding API "
+            "(managed service, e.g., OpenAI/Cohere)."
+        )
+    return (
+        "Requirements note: production model deployment preference = OpenSearch node "
+        "(co-located with search cluster, simplest ops)."
+    )
+
+
+def _build_prefix_wildcard_requirement_note(enabled: bool) -> str:
+    """Build canonical requirement note for prefix/wildcard preference."""
+    if enabled:
+        return (
+            "Requirements note: prefix/wildcard matching preference = enabled (user-requested). "
+            "Include lexical BM25 capability to support prefix/wildcard behavior."
+        )
+    return (
+        "Requirements note: prefix/wildcard matching preference = disabled (default unless user-requested). "
+        "Do NOT force lexical BM25 solely for prefix/wildcard support."
+    )
+
+
+def _extract_text_field_preview(
+    candidate_fields: list[str] | None = None,
+    max_fields: int = 3,
+) -> str:
+    """Extract a stable, deduplicated field preview for user-facing prompts."""
+    cleaned_fields: list[str] = []
+    seen: set[str] = set()
+    for raw_field in candidate_fields or []:
+        field = str(raw_field or "").strip()
+        if not field:
+            continue
+        lowered = field.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        cleaned_fields.append(field)
+        if len(cleaned_fields) >= max(1, max_fields):
+            break
+    return ", ".join(cleaned_fields)
+
+
+def _build_semantic_query_pattern_prompt(
+    candidate_fields: list[str] | None = None,
+    max_fields: int = 3,
+) -> str:
+    """Build semantic query-pattern prompt with optional text-field context."""
+    preview = _extract_text_field_preview(candidate_fields, max_fields=max_fields)
+    question = (
+        "For your semantic search use cases, which best describes the typical user query style?"
+    )
+    if preview:
+        return f"From your sample data, fields like {preview} look text-heavy.\n\n{question}"
+    return question
+
+
+def _build_model_deployment_preference_prompt(
+    candidate_fields: list[str] | None = None,
+    max_fields: int = 3,
+) -> str:
+    """Build a user-friendly embedding-hosting prompt with optional field context."""
+    preview = _extract_text_field_preview(candidate_fields, max_fields=max_fields)
+
+    shared_suffix = (
+        "To enable semantic search, we use an embedding model "
+        "(an AI model that turns text into meaning vectors) so search can match intent, "
+        "not just exact words. For production, where should this embedding model run?"
+    )
+    if preview:
+        return shared_suffix
+    return f"Your sample data includes text content suitable for semantic search. {shared_suffix}"
+
+
+def _read_model_deployment_preference_choice(
+    candidate_fields: list[str] | None = None,
+) -> str:
+    """Read and normalize production semantic-model deployment preference."""
+    selected = read_single_choice_input(
+        title="Embedding Model Hosting",
+        prompt=_build_model_deployment_preference_prompt(candidate_fields),
+        options=[
+            (
+                _MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE,
+                "OpenSearch node (co-located with search cluster, simplest ops)",
+            ),
+            (
+                _MODEL_DEPLOYMENT_OPTION_SAGEMAKER_ENDPOINT,
+                "SageMaker endpoint (separate compute, more flexible scaling)",
+            ),
+            (
+                _MODEL_DEPLOYMENT_OPTION_EXTERNAL_EMBEDDING_API,
+                "External embedding API (e.g., OpenAI, Cohere - managed service)",
+            ),
+        ],
+        default_value=_MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE,
+    )
+    normalized = str(selected or _MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE).strip().lower()
+    if normalized not in {
+        _MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE,
+        _MODEL_DEPLOYMENT_OPTION_SAGEMAKER_ENDPOINT,
+        _MODEL_DEPLOYMENT_OPTION_EXTERNAL_EMBEDDING_API,
+    }:
+        return _MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE
+    return normalized
+
+
+
+def _is_semantic_dominant_query_pattern(profile: str | None) -> bool:
+    """Return True when query-pattern preference indicates semantic-dominant traffic."""
+    normalized = str(profile or "").strip().lower()
+    return normalized in {
+        _HYBRID_WEIGHT_OPTION_SEMANTIC,
+        _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC,
+    }
+
+
+def _build_hybrid_weight_profile_note(profile: str) -> str:
+    """Build canonical hybrid-weight profile line for planner/worker context."""
+    normalized = str(profile or "").strip().lower()
+    if normalized not in {
+        _HYBRID_WEIGHT_OPTION_SEMANTIC,
+        _HYBRID_WEIGHT_OPTION_BALANCED,
+        _HYBRID_WEIGHT_OPTION_LEXICAL,
+    }:
+        normalized = _HYBRID_WEIGHT_OPTION_BALANCED
+    return f"{_HYBRID_WEIGHT_PROFILE_PREFIX} {normalized}"
+
+
+def _read_hybrid_weight_profile_choice(
+    candidate_fields: list[str] | None = None,
+) -> str:
+    """Read query-pattern preference that drives retrieval strategy decisions."""
+    selected_profile = read_single_choice_input(
+        title="Semantic Search Query Pattern",
+        prompt=_build_semantic_query_pattern_prompt(candidate_fields),
+        options=[
+            (
+                _QUERY_PATTERN_OPTION_MOSTLY_EXACT,
+                "Queries are mostly exact / navigational (IDs, names, short queries)",
+            ),
+            (
+                _QUERY_PATTERN_OPTION_BALANCED,
+                "Balanced (default)",
+            ),
+            (
+                _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC,
+                "Queries are mostly natural language / semantic",
+            ),
+        ],
+        default_value=_QUERY_PATTERN_OPTION_BALANCED,
+    )
+    normalized = str(selected_profile or _QUERY_PATTERN_OPTION_BALANCED).strip().lower()
+    if normalized == _QUERY_PATTERN_OPTION_MOSTLY_EXACT:
+        return _HYBRID_WEIGHT_OPTION_LEXICAL
+    if normalized == _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC:
+        return _HYBRID_WEIGHT_OPTION_SEMANTIC
+    return _HYBRID_WEIGHT_OPTION_BALANCED
+
+
+def _extract_localhost_index_options_from_error(error_text: str) -> list[str]:
+    """Extract index names from localhost-index error text that includes options."""
+    if not error_text:
+        return []
+    options: list[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(
+        r"(?m)^\s*-\s*([A-Za-z0-9._-]+)\s+\(docs=",
+        error_text,
+    ):
+        index_name = match.group(1).strip()
+        lowered = index_name.lower()
+        if not index_name or lowered in seen:
+            continue
+        seen.add(lowered)
+        options.append(index_name)
+    return options
+
+
+def _resolve_pending_localhost_index_selection(
+    user_input: str,
+    pending_options: list[str],
+) -> str | None:
+    """Resolve a user reply against pending localhost index options."""
+    if not pending_options:
+        return None
+
+    raw = (user_input or "").strip()
+    if not raw:
+        return None
+
+    number_match = re.fullmatch(r"(\d+)(?:[.)]+)?", raw)
+    if number_match:
+        index = int(number_match.group(1))
+        if 1 <= index <= len(pending_options):
+            return pending_options[index - 1]
+
+    lowered_raw = raw.lower().strip("'\"")
+    for option in pending_options:
+        if lowered_raw == option.lower():
+            return option
+
+    for option in sorted(pending_options, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(option)}\b", raw, flags=re.IGNORECASE):
+            return option
+    return None
+
+
+def _looks_like_pasted_sample_content(user_input: str) -> bool:
+    """Detect pasted JSON sample content for option 4 style input."""
+    raw = str(user_input or "").strip()
+    if not raw:
+        return False
+
+    if raw.startswith("{"):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            return True
+
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, list) and parsed:
+            return all(isinstance(item, dict) for item in parsed[:3])
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return False
+    parsed_line_count = 0
+    for line in lines:
+        if not line.startswith("{"):
+            return False
+        try:
+            parsed_line = json.loads(line)
+        except Exception:
+            return False
+        if not isinstance(parsed_line, dict):
+            return False
+        parsed_line_count += 1
+    return parsed_line_count > 0
+
+
+def _looks_like_semantic_text_value(raw_value: object) -> bool:
+    """Return True when a value appears suitable for full-text/semantic retrieval."""
+    if not isinstance(raw_value, str):
+        return False
+
+    value = raw_value.strip()
+    if len(value) < 3:
+        return False
+
+    lowered = value.lower()
+    if lowered in {"true", "false", "null", "none", "nan", "n/a", "na"}:
+        return False
+    if _NUMERIC_STRING_PATTERN.fullmatch(value):
+        return False
+    if _DATEISH_STRING_PATTERN.fullmatch(value):
+        return False
+
+    alpha_count = sum(1 for ch in value if ch.isalpha())
+    if alpha_count < 3:
+        return False
+    if not re.search(r"[A-Za-z]{2,}", value):
+        return False
+    return True
+
+
+def _infer_semantic_text_fields(sample_doc: object, max_fields: int = 6) -> list[str]:
+    """Infer candidate non-keyword text fields from a sample document."""
+    if not isinstance(sample_doc, dict):
+        return []
+
+    candidates: list[str] = []
+    for raw_field, raw_value in sample_doc.items():
+        field = str(raw_field or "").strip()
+        if not field:
+            continue
+
+        lowered_field = field.lower()
+        field_tokens = [token for token in re.split(r"[^a-z0-9]+", lowered_field) if token]
+        if any(token in _EXCLUDED_TEXT_FIELD_NAME_TOKENS for token in field_tokens):
+            continue
+
+        values_to_check: list[object]
+        if isinstance(raw_value, list):
+            values_to_check = list(raw_value[:3])
+        else:
+            values_to_check = [raw_value]
+
+        if any(_looks_like_semantic_text_value(item) for item in values_to_check):
+            candidates.append(field)
+            if len(candidates) >= max_fields:
+                break
+
+    return candidates
+
+
+def _build_text_search_use_case_note(
+    text_search_required: bool | None,
+    candidate_fields: list[str] | None = None,
+) -> str:
+    """Build a deterministic requirement note for text-search inference."""
+    fields = [str(field).strip() for field in (candidate_fields or []) if str(field).strip()]
+    if text_search_required:
+        field_suffix = f" Candidate fields: {', '.join(fields)}." if fields else ""
+        return (
+            "Requirements note: inferred search use case = yes, text-based search is needed, "
+            "because sample/schema has non-keyword text fields suitable for semantic/full-text retrieval."
+            f"{field_suffix} Do NOT ask whether text-based search is needed."
+        )
+    if text_search_required is False:
+        return (
+            "Requirements note: inferred search use case = primarily numeric/filter-based "
+            "(no strong non-keyword text-field signal in the provided sample/schema). "
+            "Do NOT ask a query-pattern checklist or future text-field expectation questions."
+        )
+    return (
+        "Requirements note: infer search use case from sample/schema directly. "
+        "Do NOT ask a query-pattern checklist."
+    )
+
+
+def _capture_sample_from_result(state: SessionState, result: str) -> bool:
+    """Try to parse a submit result and update local state. Returns True on success."""
+    try:
+        parsed = json.loads(result)
+        if isinstance(parsed, dict) and "sample_doc" in parsed:
+            state.sample_doc_json = json.dumps(parsed["sample_doc"], ensure_ascii=False)
+            source_local_file = str(parsed.get("source_local_file", "")).strip()
+            source_index_name = str(parsed.get("source_index_name", "")).strip()
+            state.source_local_file = source_local_file or None
+            state.source_index_name = source_index_name or None
+            return True
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return False
+
+
+def _clear_orchestrator_sample_state(state: SessionState) -> None:
+    state.sample_doc_json = None
+    state.source_local_file = None
+    state.source_index_name = None
+    state.source_index_doc_count = None
+    state.inferred_text_search_required = None
+    state.inferred_semantic_text_fields = []
+    state.pending_localhost_index_options = []
+
+
+def _reset_session_state(state: SessionState) -> None:
+    _clear_orchestrator_sample_state(state)
+    state.budget_preference = None
+    state.performance_priority = None
+    state.model_deployment_preference = None
+    state.prefix_wildcard_enabled = None
+    state.hybrid_weight_profile = None
+
+
+def _orchestrator_submit_sample_doc(state: SessionState, doc: str) -> str:
+    """Parse a sample document provided by the user.
+
+    Args:
+        doc: User-provided sample document, preferably JSON.
+
+    Returns:
+        str: JSON string with ``sample_doc`` on success, or an error message.
+    """
+    result = submit_sample_doc(doc)
+    _capture_sample_from_result(state, result)
+    return result
+
+
+def _extract_sample_doc_from_state(sample_doc_json: str | None) -> dict | None:
+    raw = str(sample_doc_json or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(parsed, dict):
+        sample_doc = parsed.get("sample_doc")
+        if isinstance(sample_doc, dict):
+            return sample_doc
+        return parsed
+    return None
+
+
+def _augment_worker_context_with_source(state: SessionState, context: str) -> str:
+    raw_context = str(context or "")
+    stripped = raw_context.strip()
+
+    resume_mode = False
+    execution_context = stripped
+    if execution_context.startswith(_RESUME_WORKER_MARKER):
+        resume_mode = True
+        execution_context = execution_context[len(_RESUME_WORKER_MARKER) :].strip()
+
+    if not execution_context:
+        execution_context = stripped
+
+    missing_lines: list[str] = []
+    has_source_local_file = bool(worker_resolve_source_local_file(execution_context))
+    has_localhost_source, _ = worker_resolve_localhost_source_protection(execution_context)
+    if not has_source_local_file and not has_localhost_source:
+        if state.source_local_file:
+            missing_lines.append(f"Source: {state.source_local_file}")
+        elif state.source_index_name:
+            missing_lines.append(f"Source: localhost OpenSearch index '{state.source_index_name}'")
+
+    has_sample_doc = bool(worker_extract_sample_doc_json(execution_context))
+    if not has_sample_doc:
+        sample_doc = _extract_sample_doc_from_state(state.sample_doc_json)
+        if isinstance(sample_doc, dict) and sample_doc:
+            sample_doc_line = json.dumps(sample_doc, ensure_ascii=False)
+            missing_lines.append(f"Sample document: {sample_doc_line}")
+
+    if (
+        not missing_lines
+        or _SYSTEM_SOURCE_CONTEXT_HEADER.lower() in execution_context.lower()
+    ):
+        return raw_context
+
+    augmented = execution_context.rstrip()
+    if augmented:
+        augmented += "\n\n"
+    augmented += _SYSTEM_SOURCE_CONTEXT_HEADER + "\n" + "\n".join(missing_lines)
+    if resume_mode:
+        return f"{_RESUME_WORKER_MARKER}\n{augmented}"
+    return augmented
+
+
+def _run_worker_agent_with_state(state: SessionState, context: str) -> str:
+    return worker_agent_impl(_augment_worker_context_with_source(state, context))
 
 
 # -------------------------------------------------------------------------
 # Agent Factory
 # -------------------------------------------------------------------------
 
-def _create_orchestrator_agent() -> Agent:
+def _create_orchestrator_agent(state: SessionState) -> Agent:
     """Build a fresh orchestrator agent (no conversation history)."""
     model = BedrockModel(
         model_id=MODEL_ID,
@@ -118,14 +904,19 @@ def _create_orchestrator_agent() -> Agent:
             }
         },
     )
+    def submit_sample_doc(doc: str) -> str:
+        return _orchestrator_submit_sample_doc(state, doc)
+
+    def worker_agent(context: str) -> str:
+        return _run_worker_agent_with_state(state, context)
+
     return Agent(
         model=model,
         system_prompt=SYSTEM_PROMPT,
         tools=[
-            submit_sample_doc,
-            get_sample_doc,
+            tool(submit_sample_doc),
             solution_planning_assistant,
-            worker_agent,
+            tool(worker_agent),
         ],
         callback_handler=ThinkingCallbackHandler(),
     )
@@ -135,13 +926,13 @@ def _create_orchestrator_agent() -> Agent:
 # State Management
 # -------------------------------------------------------------------------
 
-def _reset_all_state() -> tuple[Phase, Agent]:
+def _reset_all_state(state: SessionState) -> tuple[Phase, Agent]:
     """Full reset: sample doc, planner session, and orchestrator agent."""
-    clear_sample_doc()
+    _reset_session_state(state)
     clear_last_worker_context()
     clear_last_worker_run_state()
     reset_planner_agent()
-    agent = _create_orchestrator_agent()
+    agent = _create_orchestrator_agent(state)
     return Phase.COLLECT_SAMPLE, agent
 
 
@@ -154,8 +945,10 @@ async def main():
 
     print(f"Initializing Orchestrator Agent with model: {MODEL_ID}...")
 
+    state = SessionState()
+
     try:
-        agent = _create_orchestrator_agent()
+        agent = _create_orchestrator_agent(state)
     except Exception as e:
         print(f"Failed to initialize orchestrator: {e}")
         return
@@ -175,6 +968,9 @@ async def main():
             if user_input.lower() in ("exit", "quit"):
                 print("Goodbye!")
                 break
+
+            # Preserve the raw user message for source detection and final prompt handoff.
+            raw_user_input = user_input
 
             # ── Intent routing (hard-coded, before LLM) ────────────
 
@@ -208,8 +1004,9 @@ async def main():
                 else:
                     retry_reason = "auto-resume from failed phase"
 
-                retry_result = worker_agent(
-                    f"[RESUME_WORKER_FROM_FAILED_STEP]\n{recovery_context}"
+                retry_result = _run_worker_agent_with_state(
+                    state,
+                    f"{_RESUME_WORKER_MARKER}\n{recovery_context}",
                 )
                 print(f"Orchestrator: ({retry_reason}) {retry_result}\n")
                 check_and_clear_execution_flag()
@@ -219,7 +1016,7 @@ async def main():
                 continue
 
             if looks_like_new_request(user_input):
-                phase, agent = _reset_all_state()
+                phase, agent = _reset_all_state(state)
                 user_input = (
                     "The user started a new request. Ignore all previous context.\n"
                     f"New request: {user_input}\n"
@@ -227,13 +1024,13 @@ async def main():
                 )
 
             elif looks_like_cancel(user_input) and phase != Phase.COLLECT_SAMPLE:
-                phase, agent = _reset_all_state()
+                phase, agent = _reset_all_state(state)
                 print("Orchestrator: Request cancelled. Feel free to start a new request.\n")
                 continue
 
             elif phase == Phase.DONE:
                 # Any input after a completed flow starts a fresh cycle.
-                phase, agent = _reset_all_state()
+                phase, agent = _reset_all_state(state)
                 user_input = (
                     "The previous workflow is not active. The user has a new request.\n"
                     f"New request: {user_input}\n"
@@ -243,52 +1040,391 @@ async def main():
             # ── Phase-specific pre-processing ───────────────────────
 
             if phase in (Phase.COLLECT_SAMPLE, Phase.GATHER_INFO):
-                sample_state = get_sample_doc()
-                if sample_state == "MISSING_SAMPLE_DOC":
+                if state.sample_doc_json is None:
                     load_result = None
                     source_label = None
+                    source_detection_input = raw_user_input
+                    normalized_input = source_detection_input.strip().lower()
+                    option_3_selected = normalized_input in {"3", "option 3", "choice 3"}
+                    option_4_selected = normalized_input in {"4", "option 4", "choice 4"}
+                    pending_selected_index = _resolve_pending_localhost_index_selection(
+                        source_detection_input,
+                        state.pending_localhost_index_options,
+                    )
 
-                    if looks_like_url_message(user_input):
-                        load_result = submit_sample_doc_from_url(user_input)
+                    if pending_selected_index:
+                        load_result = submit_sample_doc_from_localhost_index(pending_selected_index)
+                        source_label = "localhost OpenSearch index"
+                        state.pending_localhost_index_options = []
+                    elif (
+                        looks_like_localhost_index_message(source_detection_input)
+                        or option_3_selected
+                    ):
+                        index_hint = "" if option_3_selected else source_detection_input
+                        load_result = submit_sample_doc_from_localhost_index(index_hint)
+                        source_label = "localhost OpenSearch index"
+                    elif _looks_like_pasted_sample_content(source_detection_input):
+                        state.pending_localhost_index_options = []
+                        load_result = _orchestrator_submit_sample_doc(
+                            state,
+                            source_detection_input,
+                        )
+                        source_label = "pasted sample content"
+                    elif (
+                        looks_like_builtin_imdb_sample_request(source_detection_input)
+                        or normalized_input in {"1", "option 1", "choice 1"}
+                    ):
+                        state.pending_localhost_index_options = []
+                        load_result = submit_sample_doc_from_local_file(BUILTIN_IMDB_SAMPLE_PATH)
+                        source_label = f"built-in IMDb sample file ({BUILTIN_IMDB_SAMPLE_PATH})"
+                    elif looks_like_url_message(source_detection_input):
+                        state.pending_localhost_index_options = []
+                        load_result = submit_sample_doc_from_url(source_detection_input)
                         source_label = "URL"
-                    elif looks_like_local_path_message(user_input):
-                        load_result = submit_sample_doc_from_local_file(user_input)
+                    elif looks_like_local_path_message(source_detection_input):
+                        state.pending_localhost_index_options = []
+                        load_result = submit_sample_doc_from_local_file(source_detection_input)
                         source_label = "local file/folder path"
+                    elif option_4_selected:
+                        state.pending_localhost_index_options = []
+                        user_input = (
+                            f"{raw_user_input}\n\n"
+                            "System instruction: The user selected option 4 (paste sample content). "
+                            "Ask the user to paste 1-3 representative JSON records now. "
+                            "Provide this example format:\n"
+                            '{"id":"1","title":"Example A","description":"Sample text A","category":"demo"}\n'
+                            '{"id":"2","title":"Example B","description":"Sample text B","category":"demo"}\n'
+                            "then call submit_sample_doc with that content."
+                        )
+                    elif normalized_input in {"2", "option 2", "choice 2"}:
+                        state.pending_localhost_index_options = []
+                        load_result = (
+                            "Error: option 2 selected, but no local path or URL was provided. "
+                            f"Supported formats: {SUPPORTED_SAMPLE_FILE_FORMATS_COMMA}."
+                        )
+                        source_label = "path/URL option"
 
-                    if load_result and load_result.startswith("Sample document loaded from"):
-                        phase = Phase.GATHER_INFO
-                        if source_label == "local file/folder path":
-                            user_input = (
-                                "[SYSTEM PRE-PROCESSING RESULT]\n"
-                                "A sample document has already been loaded from the user's local source.\n"
-                                f"Load result: {load_result}\n"
-                                "ACTION REQUIRED: Call `get_sample_doc` immediately, then proceed to "
-                                "Phase 2 (requirements gathering). DO NOT ask the user to paste sample content.\n\n"
-                                "[USER MESSAGE]\n"
-                                f"{user_input}"
-                            )
+                    loaded = load_result and _capture_sample_from_result(state, load_result)
+
+                    if loaded:
+                        state.pending_localhost_index_options = []
+                        parsed_result = json.loads(load_result)
+                        status_msg = parsed_result.get("status", "")
+                        if status_msg:
+                            print(f"Orchestrator: {status_msg}\n")
+                        sample_payload = parsed_result["sample_doc"]
+                        sample_json = json.dumps(sample_payload, ensure_ascii=False)
+                        state.inferred_semantic_text_fields = _infer_semantic_text_fields(sample_payload)
+                        state.inferred_text_search_required = bool(state.inferred_semantic_text_fields)
+                        source_is_localhost_index = bool(
+                            parsed_result.get("source_localhost_index")
+                        )
+                        if source_is_localhost_index:
+                            state.source_index_name = str(
+                                parsed_result.get("source_index_name", "")
+                            ).strip() or None
+                            raw_doc_count = parsed_result.get("source_index_doc_count")
+                            if isinstance(raw_doc_count, bool):
+                                state.source_index_doc_count = None
+                            elif isinstance(raw_doc_count, int):
+                                state.source_index_doc_count = max(0, raw_doc_count)
+                            else:
+                                state.source_index_doc_count = None
                         else:
-                            user_input = (
-                                "[SYSTEM PRE-PROCESSING RESULT]\n"
-                                f"A sample document has already been loaded from the user's {source_label}.\n"
-                                f"Load result: {load_result}\n"
-                                "ACTION REQUIRED: Call `get_sample_doc` immediately, then proceed to "
-                                "Phase 2 (requirements gathering). DO NOT ask the user to paste sample content.\n\n"
-                                "[USER MESSAGE]\n"
-                                f"{user_input}"
+                            state.source_index_name = None
+                            state.source_index_doc_count = None
+
+                        execution_policy_note = ""
+                        if source_is_localhost_index:
+                            index_suffix = (
+                                f" '{state.source_index_name}'"
+                                if state.source_index_name
+                                else ""
                             )
+                            execution_policy_note = (
+                                "Execution policy: source is localhost OpenSearch index"
+                                f"{index_suffix} (system-enforced, not user-stated); "
+                                "if target index already exists during setup, "
+                                "do NOT recreate it (replace_if_exists=false). "
+                                "Use a different target index name.\n"
+                            )
+                        doc_count_note = ""
+                        if source_is_localhost_index and isinstance(state.source_index_doc_count, int):
+                            doc_count_note = (
+                                "Requirements note: exact current document count already measured "
+                                f"from OpenSearch count API: {state.source_index_doc_count:,}. "
+                                "Do NOT ask current-count or growth-projection questions. "
+                                "Assume this is representative sample data and ingestion will continue.\n"
+                            )
+                        query_features_note = f"{_DEFAULT_QUERY_FEATURES_NOTE}\n"
+                        text_search_use_case_note = (
+                            f"{_build_text_search_use_case_note(state.inferred_text_search_required, state.inferred_semantic_text_fields)}\n"
+                        )
+
+                        phase = Phase.GATHER_INFO
+                        user_input = (
+                            "[SYSTEM PRE-PROCESSING RESULT]\n"
+                            f"A sample document has already been loaded from {source_label}.\n"
+                            f"Load result: {status_msg}\n"
+                            f"{execution_policy_note}"
+                            f"{doc_count_note}"
+                            f"{query_features_note}"
+                            f"{text_search_use_case_note}"
+                            f"Sample document: {sample_json}\n"
+                            "ACTION REQUIRED: Proceed to Phase 2 (requirements gathering). "
+                            "DO NOT ask the user to paste sample content.\n\n"
+                            "[USER MESSAGE]\n"
+                            f"{raw_user_input}"
+                        )
                     elif load_result and load_result.startswith("Error:"):
                         source = source_label or "source"
-                        user_input = (
-                            f"{user_input}\n\n"
-                            f"System note: Automatic sample loading from user's {source} failed.\n"
-                            f"Failure reason: {load_result}\n"
-                            "System instruction: Briefly tell the user this exact failure reason, "
-                            "then ask them to provide a corrected accessible path/URL or paste one sample document."
+                        localhost_empty_index_error = (
+                            source_label == "localhost OpenSearch index"
+                            and "has no documents" in load_result.lower()
                         )
+                        localhost_index_selection_error = (
+                            source_label == "localhost OpenSearch index"
+                            and (
+                                "no index name was provided" in load_result.lower()
+                                or (
+                                    "was not found on local opensearch" in load_result.lower()
+                                    and "available non-system indices" in load_result.lower()
+                                )
+                            )
+                        )
+                        if localhost_empty_index_error:
+                            state.pending_localhost_index_options = []
+                            user_input = (
+                                f"{raw_user_input}\n\n"
+                                "System note: Automatic sample loading from localhost OpenSearch index failed.\n"
+                                f"Failure reason: {load_result}\n"
+                                "System instruction: The user already provided the index name. "
+                                "Do NOT ask for the index name again. "
+                                "Briefly explain that the index is empty, then ask the user to choose one of these: "
+                                "ingest at least one document into the same index and reply retry, "
+                                "provide a local path/URL in a supported format "
+                                f"({SUPPORTED_SAMPLE_FILE_FORMATS_SLASH}) (option 2), "
+                                "or use built-in IMDb sample (option 1), "
+                                "or paste sample content directly (option 4)."
+                            )
+                        elif localhost_index_selection_error:
+                            state.pending_localhost_index_options = (
+                                _extract_localhost_index_options_from_error(load_result)
+                            )
+                            user_input = (
+                                f"{raw_user_input}\n\n"
+                                "System note: Automatic sample loading from localhost OpenSearch index failed.\n"
+                                f"Failure reason: {load_result}\n"
+                                "System instruction: Briefly tell the user this exact failure reason. "
+                                "If the failure reason includes an index list, present that list and ask the user "
+                                "to pick one index name from it for option 3 (they can reply with the list number "
+                                "or exact index name). "
+                                "Also mention alternatives: built-in IMDb sample (option 1), corrected path/URL "
+                                f"(option 2, formats: {SUPPORTED_SAMPLE_FILE_FORMATS_SLASH}), "
+                                "or pasted sample content (option 4)."
+                            )
+                        else:
+                            state.pending_localhost_index_options = []
+                            user_input = (
+                                f"{raw_user_input}\n\n"
+                                f"System note: Automatic sample loading from {source} failed.\n"
+                                f"Failure reason: {load_result}\n"
+                                "System instruction: Briefly tell the user this exact failure reason, "
+                                "then ask them to provide one of these: "
+                                "built-in IMDb sample (option 1), corrected path/URL (option 2), "
+                                f"where supported formats are {SUPPORTED_SAMPLE_FILE_FORMATS_SLASH}, "
+                                "a valid localhost index name (option 3), "
+                                "or pasted sample content (option 4)."
+                            )
                 elif phase == Phase.COLLECT_SAMPLE:
-                    # Sample doc already present (e.g. agent loaded it in an earlier turn).
                     phase = Phase.GATHER_INFO
+
+            if phase == Phase.GATHER_INFO and state.sample_doc_json is not None:
+                if state.inferred_text_search_required is None:
+                    try:
+                        parsed_sample_doc = json.loads(state.sample_doc_json)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_sample_doc = None
+                    if parsed_sample_doc is not None:
+                        state.inferred_semantic_text_fields = _infer_semantic_text_fields(parsed_sample_doc)
+                        state.inferred_text_search_required = bool(state.inferred_semantic_text_fields)
+
+                if state.budget_preference is None:
+                    state.budget_preference = _infer_budget_preference_from_text(raw_user_input)
+                if state.performance_priority is None:
+                    state.performance_priority = _infer_performance_priority_from_text(raw_user_input)
+                if state.prefix_wildcard_enabled is None:
+                    state.prefix_wildcard_enabled = _infer_prefix_wildcard_preference_from_text(
+                        raw_user_input
+                    )
+                if state.budget_preference is None:
+                    state.budget_preference = read_single_choice_input(
+                        title="Budget Preference",
+                        prompt=(
+                            "Choose budget/cost preference for this solution."
+                        ),
+                        options=[
+                            (
+                                _BUDGET_OPTION_FLEXIBLE,
+                                "No strict budget constraints (flexible)",
+                            ),
+                            (
+                                _BUDGET_OPTION_COST_SENSITIVE,
+                                "Cost-sensitive (prioritize cost-effectiveness)",
+                            ),
+                        ],
+                        default_value=_BUDGET_OPTION_FLEXIBLE,
+                    )
+                if state.performance_priority is None:
+                    state.performance_priority = read_single_choice_input(
+                        title="Performance Priority",
+                        prompt=(
+                            "Choose the primary speed-vs-accuracy priority."
+                        ),
+                        options=[
+                            (
+                                _PERFORMANCE_OPTION_SPEED,
+                                "Speed-first",
+                            ),
+                            (
+                                _PERFORMANCE_OPTION_BALANCED,
+                                "Balanced",
+                            ),
+                            (
+                                _PERFORMANCE_OPTION_ACCURACY,
+                                "Accuracy-first",
+                            ),
+                        ],
+                        default_value=_PERFORMANCE_OPTION_BALANCED,
+                    )
+                if (
+                    state.prefix_wildcard_enabled is None
+                    and state.inferred_text_search_required
+                ):
+                    state.prefix_wildcard_enabled = False
+                if (
+                    state.hybrid_weight_profile is None
+                    and bool(state.inferred_text_search_required)
+                ):
+                    state.hybrid_weight_profile = _read_hybrid_weight_profile_choice(
+                        state.inferred_semantic_text_fields
+                    )
+                if (
+                    state.model_deployment_preference is None
+                    and bool(state.inferred_text_search_required)
+                    and _is_semantic_dominant_query_pattern(state.hybrid_weight_profile)
+                ):
+                    state.model_deployment_preference = _read_model_deployment_preference_choice(
+                        state.inferred_semantic_text_fields
+                    )
+            if state.source_index_name:
+                extra_notes: list[str] = []
+                if "Execution policy: source is localhost OpenSearch index" not in user_input:
+                    extra_notes.append(
+                        "Execution policy: source is localhost OpenSearch index "
+                        f"'{state.source_index_name}' (system-enforced, not user-stated); "
+                        "if target index already exists during setup, "
+                        "do NOT recreate it (replace_if_exists=false). "
+                        "Use a different target index name."
+                    )
+                if (
+                    isinstance(state.source_index_doc_count, int)
+                    and "Requirements note: exact current document count already measured from OpenSearch count API" not in user_input
+                ):
+                    extra_notes.append(
+                        "Requirements note: exact current document count already measured from OpenSearch count API: "
+                        f"{state.source_index_doc_count:,}. Do NOT ask current-count or growth-projection questions; "
+                        "assume this is representative sample data and ingestion will continue."
+                    )
+                if extra_notes:
+                    user_input = (
+                        f"{user_input}\n\n"
+                        "[SYSTEM EXECUTION POLICY]\n"
+                        + "\n".join(extra_notes)
+                    )
+
+            if state.sample_doc_json is not None:
+                if state.inferred_text_search_required is None:
+                    try:
+                        parsed_sample_doc = json.loads(state.sample_doc_json)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_sample_doc = None
+                    if parsed_sample_doc is not None:
+                        state.inferred_semantic_text_fields = _infer_semantic_text_fields(parsed_sample_doc)
+                        state.inferred_text_search_required = bool(state.inferred_semantic_text_fields)
+
+                requirement_notes: list[str] = []
+                if _DEFAULT_QUERY_FEATURES_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_DEFAULT_QUERY_FEATURES_NOTE)
+                if _TEXT_SEARCH_USE_CASE_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(
+                        _build_text_search_use_case_note(
+                            state.inferred_text_search_required,
+                            state.inferred_semantic_text_fields,
+                        )
+                    )
+                if _MODEL_DEPLOYMENT_SCOPE_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_MODEL_DEPLOYMENT_SCOPE_NOTE)
+                if _PERFORMANCE_PRIORITY_SCOPE_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_PERFORMANCE_PRIORITY_SCOPE_NOTE)
+                if _SAMPLE_FINAL_TRUTH_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_SAMPLE_FINAL_TRUTH_NOTE)
+                if (
+                    state.inferred_text_search_required
+                    and _is_semantic_dominant_query_pattern(state.hybrid_weight_profile)
+                    and _NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE_PREFIX not in user_input
+                ):
+                    requirement_notes.append(_NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE)
+                if _SEMANTIC_EXPANSION_EXPLANATION_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_SEMANTIC_EXPANSION_EXPLANATION_NOTE)
+                if _MAPPING_CLARITY_FEEDBACK_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_MAPPING_CLARITY_FEEDBACK_NOTE)
+                if _DEFAULT_SPECIFIC_USE_CASES_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_DEFAULT_SPECIFIC_USE_CASES_NOTE)
+                if _DEFAULT_QUERY_SUPPORT_SCOPE_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_DEFAULT_QUERY_SUPPORT_SCOPE_NOTE)
+                if _DEFAULT_DASHBOARD_REQUIREMENT_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_DEFAULT_DASHBOARD_REQUIREMENT_NOTE)
+                if _DEFAULT_REALTIME_REQUIREMENT_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_DEFAULT_REALTIME_REQUIREMENT_NOTE)
+                if _DEFAULT_CUSTOM_REQUIREMENTS_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_DEFAULT_CUSTOM_REQUIREMENTS_NOTE)
+                if state.budget_preference and _BUDGET_PREFERENCE_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_build_budget_preference_note(state.budget_preference))
+                if state.performance_priority and _PERFORMANCE_PREFERENCE_NOTE_PREFIX not in user_input:
+                    requirement_notes.append(_build_performance_preference_note(state.performance_priority))
+                if (
+                    state.hybrid_weight_profile
+                    and _SEMANTIC_QUERY_PATTERN_PREFERENCE_NOTE_PREFIX not in user_input
+                ):
+                    requirement_notes.append(
+                        _build_semantic_query_pattern_preference_note(state.hybrid_weight_profile)
+                    )
+                if (
+                    state.prefix_wildcard_enabled is not None
+                    and _PREFIX_WILDCARD_REQUIREMENT_NOTE_PREFIX not in user_input
+                ):
+                    requirement_notes.append(
+                        _build_prefix_wildcard_requirement_note(state.prefix_wildcard_enabled)
+                    )
+                if (
+                    state.model_deployment_preference
+                    and _MODEL_DEPLOYMENT_PREFERENCE_NOTE_PREFIX not in user_input
+                ):
+                    requirement_notes.append(
+                        _build_model_deployment_preference_note(state.model_deployment_preference)
+                    )
+                if (
+                    state.hybrid_weight_profile
+                    and _HYBRID_WEIGHT_PROFILE_PREFIX not in user_input
+                ):
+                    requirement_notes.append(_build_hybrid_weight_profile_note(state.hybrid_weight_profile))
+                if requirement_notes:
+                    user_input = (
+                        f"{user_input}\n\n"
+                        "[SYSTEM REQUIREMENT DEFAULTS]\n"
+                        + "\n".join(requirement_notes)
+                    )
 
             # ── Agent turn ──────────────────────────────────────────
 
@@ -302,7 +1438,7 @@ async def main():
 
             # ── Post-turn phase transitions ─────────────────────────
 
-            if phase == Phase.COLLECT_SAMPLE and get_sample_doc() != "MISSING_SAMPLE_DOC":
+            if phase == Phase.COLLECT_SAMPLE and state.sample_doc_json is not None:
                 phase = Phase.GATHER_INFO
 
             if check_and_clear_execution_flag():
