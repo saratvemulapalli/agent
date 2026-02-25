@@ -3,6 +3,7 @@ import os
 import re
 import csv
 import math
+import sys
 from typing import Any, Dict, Optional
 from pathlib import Path
 from html import unescape
@@ -1385,7 +1386,7 @@ def search_opensearch_org(query: str, numberOfResults: int = 5) -> str:
         str: JSON string with query and filtered results from opensearch.org.
     """
     try:
-        print(f"\033[91m[search_opensearch_org] Query: {query}\033[0m")
+        print(f"\033[91m[search_opensearch_org] Query: {query}\033[0m", file=sys.stderr)
 
         limited_results = max(1, min(numberOfResults, 10))
         search_query = quote_plus(f"site:opensearch.org {query}")

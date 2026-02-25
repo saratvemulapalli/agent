@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 
 from strands import Agent, tool
 from strands.models import BedrockModel
@@ -181,16 +182,23 @@ Structure:
 
 model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
-model = BedrockModel(
-    model_id=model_id,
-    max_tokens=16000,
-    additional_request_fields={
-        "thinking": {
-            "type": "enabled",
-            "budget_tokens": 4000,
-        }
-    }
-)
+_model = None
+
+
+def _get_model() -> BedrockModel:
+    global _model
+    if _model is None:
+        _model = BedrockModel(
+            model_id=model_id,
+            max_tokens=16000,
+            additional_request_fields={
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 4000,
+                }
+            },
+        )
+    return _model
 
 _CANONICAL_CAPABILITY_PREFIX = re.compile(
     r"^[-*]\s*(Exact|Semantic|Structured|Combined|Autocomplete|Fuzzy)\s*:",
@@ -551,23 +559,29 @@ def _looks_like_planner_confirmation(user_input: str) -> bool:
     return _PLANNER_CONFIRMATION_PATTERN.search(text) is not None
 
 
+_agent = None
+
+
 def _create_planner_agent() -> Agent:
     return Agent(
-        model=model,
+        model=_get_model(),
         system_prompt=SYSTEM_PROMPT,
         tools=[tool(read_knowledge_base), tool(read_dense_vector_models), tool(read_sparse_vector_models), tool(search_opensearch_org)],
         callback_handler=ThinkingCallbackHandler(output_color="\033[94m"),  # Blue output
     )
 
 
+def _get_planner_agent() -> Agent:
+    global _agent
+    if _agent is None:
+        _agent = _create_planner_agent()
+    return _agent
+
+
 def reset_planner_agent() -> None:
     """Reset the planner agent (public — called by orchestrator on new_request)."""
-    global agent
-    agent = _create_planner_agent()
-
-
-# Initialize the internal agent for planning loop
-agent = _create_planner_agent()
+    global _agent
+    _agent = None
 
 # -------------------------------------------------------------------------
 # Worker Execution
@@ -585,7 +599,7 @@ def solution_planning_assistant(context: str) -> dict:
         dict: A comprehensive technical recommendation report and conversation summary
         (Solution + Search Capabilities + Keynote).
     """
-    print(f"\033[91m[solution_planning_assistant] Input context: {context}\033[0m")
+    print(f"\033[91m[solution_planning_assistant] Input context: {context}\033[0m", file=sys.stderr)
 
     try:
         # Initial prompt to the internal agent
@@ -619,8 +633,7 @@ def solution_planning_assistant(context: str) -> dict:
         capability_precheck_retry_limit = 1
         # Interaction Loop
         while True:
-            # Get response from the planner agent
-            response = agent(current_input)
+            response = _get_planner_agent()(current_input)
             response_text = str(response)
 
             # Check for completion tags
@@ -804,7 +817,7 @@ def solution_planning_assistant(context: str) -> dict:
                     current_input = user_input
                     break
 
-                print("Please share feedback, or indicate when you're ready to proceed.")
+                print("Please share feedback, or indicate when you're ready to proceed.", file=sys.stderr)
 
     except Exception as e:
         raise e
@@ -828,4 +841,4 @@ if __name__ == "__main__":
     # Test run
     sample_context = "I have 10 million documents, mostly English. Low latency is critical (<50ms). Budget is flexible. Preference for managed services."
     result = solution_planning_assistant(SAMPLE_CONTEXT)
-    print(result)
+    print(result, file=sys.stderr)

@@ -1,11 +1,14 @@
 import json
 import re
+import sys
 from pathlib import Path
 
 from strands import Agent, tool
 from strands.models import BedrockModel
 from scripts.handler import ThinkingCallbackHandler
 from scripts.opensearch_ops_tools import (
+    SEARCH_UI_HOST,
+    SEARCH_UI_PORT,
     apply_capability_driven_verification as apply_capability_driven_verification_impl,
     create_index as create_index_impl,
     create_and_attach_pipeline,
@@ -161,6 +164,54 @@ _DOCKER_RECONNECT_GUIDANCE = (
     "Please reconnect Docker (restart Docker Desktop/service) and retry this run. "
     "Lexical-only fallback is disabled for this failure mode."
 )
+_LOCAL_UI_HOST_ALIASES = ("localhost", "127.0.0.1")
+
+
+def _unique_preserve_order(items: list[str]) -> list[str]:
+    unique: list[str] = []
+    for item in items:
+        if item and item not in unique:
+            unique.append(item)
+    return unique
+
+
+def _build_ui_access_urls() -> list[str]:
+    host = "localhost" if SEARCH_UI_HOST in {"0.0.0.0", "::"} else SEARCH_UI_HOST
+    candidates = [
+        f"http://{host}:{SEARCH_UI_PORT}",
+        *[f"http://{alias}:{SEARCH_UI_PORT}" for alias in _LOCAL_UI_HOST_ALIASES],
+    ]
+    return _unique_preserve_order(candidates)
+
+
+def _should_append_ui_access_hint(report: dict) -> bool:
+    if not isinstance(report, dict):
+        return False
+    if str(report.get("status", "")).strip().lower() != "success":
+        return False
+    steps = report.get("steps", {})
+    if not isinstance(steps, dict):
+        return False
+    return str(steps.get("ui_launch", "")).strip().lower() == "success"
+
+
+def _append_ui_access_hint(response_text: str, report: dict) -> str:
+    text = str(response_text or "").rstrip()
+    if not _should_append_ui_access_hint(report):
+        return text
+
+    urls = _build_ui_access_urls()
+    if any(url in text for url in urls):
+        return text
+
+    if not urls:
+        return text
+
+    ui_hint_lines = [f"UI access: open {urls[0]} in your browser."]
+    if len(urls) > 1:
+        fallback_urls = " or ".join(urls[1:])
+        ui_hint_lines.append(f"If needed, try {fallback_urls}.")
+    return text + "\n\n" + "\n".join(ui_hint_lines)
 
 
 def _extract_hybrid_weight_profile(context: str) -> str:
@@ -604,8 +655,9 @@ def _enforce_model_setup_failure_policy(response_text: str, report: dict) -> tup
 
 
 def _finalize_worker_response(response_text: str, execution_context: str, report: dict) -> str:
+    normalized_response = _append_ui_access_hint(response_text, report)
     report_block = _render_execution_report_block(report)
-    final_text = response_text.rstrip() + "\n\n" + report_block
+    final_text = normalized_response.rstrip() + "\n\n" + report_block
     _store_worker_run_state(execution_context, report, report_block)
     mark_execution_completed()
     return final_text
@@ -621,7 +673,7 @@ def worker_agent(context: str) -> str:
     Returns:
         str: Status of the execution.
     """
-    print(f"\n[Worker] Received context for execution:\n{context}")
+    print(f"\n[Worker] Received context for execution:\n{context}", file=sys.stderr)
     
     model_id = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
     

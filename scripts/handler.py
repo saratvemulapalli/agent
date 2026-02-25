@@ -1,4 +1,5 @@
 import os
+import sys
 from typing import Optional
 
 class ThinkingCallbackHandler:
@@ -22,6 +23,8 @@ class ThinkingCallbackHandler:
         self.thinking_color = thinking_color
         self.output_color = output_color
         self.reset_color = "\033[0m"
+        # Keep stdout clean for JSON-RPC transports (for example MCP stdio).
+        self.stream = sys.stderr
         if show_reasoning is None:
             env_value = os.getenv("SHOW_MODEL_REASONING", "").strip().lower()
             self.show_reasoning = env_value not in {"0", "false", "no", "off"}
@@ -37,14 +40,24 @@ class ThinkingCallbackHandler:
         # 1. Handle Thinking/Reasoning
         if reasoning_text and self.show_reasoning:
             # Print reasoning in specified thinking color
-            print(f"{self.thinking_color}{reasoning_text}{self.reset_color}", end="", flush=True)
+            print(
+                f"{self.thinking_color}{reasoning_text}{self.reset_color}",
+                end="",
+                flush=True,
+                file=self.stream,
+            )
         
         # 2. Handle Text Data
         if data:
             # Print output in specified output color
             # If output_color is reset (\033[0m), it's redundant to wrap, but consistent.
             # If it's a specific color (e.g. blue), we need to reset after.
-            print(f"{self.output_color}{data}{self.reset_color}", end="" if not complete else "\n", flush=True)
+            print(
+                f"{self.output_color}{data}{self.reset_color}",
+                end="" if not complete else "\n",
+                flush=True,
+                file=self.stream,
+            )
 
         # 3. Handle Tool Use (Restored functionality)
         if current_tool_use and current_tool_use.get("name"):
@@ -54,8 +67,8 @@ class ThinkingCallbackHandler:
                 self.tool_count += 1
                 tool_name = current_tool_use.get("name", "Unknown tool")
                 # Tool info can remain default or use a specific color if needed, keep default for now
-                print(f"\nTool #{self.tool_count}: {tool_name}.")
+                print(f"\nTool #{self.tool_count}: {tool_name}.", file=self.stream)
         
         # 4. Handle Completion
         if complete and data:
-            print("\n")
+            print("\n", file=self.stream)

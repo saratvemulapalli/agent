@@ -173,11 +173,6 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 BUILTIN_IMDB_SAMPLE_PATH = "scripts/sample_data/imdb.title.basics.tsv"
 
-
-# -------------------------------------------------------------------------
-# Local sample-doc state (replaces the former globals in scripts/tools.py)
-# -------------------------------------------------------------------------
-
 _RESUME_WORKER_MARKER = "[RESUME_WORKER_FROM_FAILED_STEP]"
 _SYSTEM_SOURCE_CONTEXT_HEADER = "[SYSTEM SOURCE CONTEXT]"
 

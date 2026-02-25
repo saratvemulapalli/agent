@@ -1,14 +1,19 @@
 from opensearchpy import OpenSearch
 
 from scripts.shared import normalize_text, value_shape, text_richness_score
+import getpass
 import json
 import os
 import platform
 import re
 import shutil
 import subprocess
+import sys
+import tempfile
 import threading
 import time
+import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -24,6 +29,12 @@ OPENSEARCH_DOCKER_CONTAINER = os.getenv("OPENSEARCH_DOCKER_CONTAINER", "opensear
 OPENSEARCH_DOCKER_START_TIMEOUT = int(os.getenv("OPENSEARCH_DOCKER_START_TIMEOUT", "120"))
 SEARCH_UI_HOST = os.getenv("SEARCH_UI_HOST", "127.0.0.1")
 SEARCH_UI_PORT = int(os.getenv("SEARCH_UI_PORT", "8765"))
+try:
+    SEARCH_UI_IDLE_TIMEOUT_SECONDS = max(
+        60, int(os.getenv("SEARCH_UI_IDLE_TIMEOUT_SECONDS", "2700"))
+    )
+except ValueError:
+    SEARCH_UI_IDLE_TIMEOUT_SECONDS = 2700
 SEARCH_UI_STATIC_DIR = (
     Path(__file__).resolve().parent / "ui" / "search_builder"
 )
@@ -58,6 +69,378 @@ class _SearchUIRuntime:
         self.suggestion_meta_by_index: dict[str, list[dict[str, object]]] = {}
 
 _search_ui = _SearchUIRuntime()
+
+_UI_STATE_FILE = Path(tempfile.gettempdir()) / f"opensearch_search_ui_{SEARCH_UI_PORT}.json"
+_ui_state_mtime: float = 0.0
+_SEARCH_UI_SERVICE_NAME = "opensearch-search-ui"
+_UI_LOCK_BASENAME = f"opensearch_search_ui_{SEARCH_UI_PORT}.lock"
+
+try:
+    _CURRENT_UID: int | None = os.getuid()
+except AttributeError:
+    _CURRENT_UID = None
+try:
+    _CURRENT_USERNAME = getpass.getuser()
+except Exception:
+    _CURRENT_USERNAME = "unknown"
+
+if _CURRENT_UID is not None:
+    _ui_owner_token = f"uid_{_CURRENT_UID}"
+else:
+    _ui_owner_token = re.sub(r"[^A-Za-z0-9_.-]", "_", _CURRENT_USERNAME or "unknown")
+
+_UI_RUNTIME_DIR = Path(tempfile.gettempdir()) / f"opensearch_search_ui_{_ui_owner_token}"
+_UI_LOCK_FILE = _UI_RUNTIME_DIR / _UI_LOCK_BASENAME
+_UI_SERVER_SCRIPT_NAME = "ui_server_standalone.py"
+_UI_SERVER_SCRIPT_PATH = str(Path(__file__).resolve().parent / _UI_SERVER_SCRIPT_NAME)
+
+_ui_instance_id: str = ""
+_ui_idle_timeout_seconds: int = SEARCH_UI_IDLE_TIMEOUT_SECONDS
+_ui_last_active_epoch: float = 0.0
+
+
+def _write_ui_state() -> None:
+    """Persist UI config so the standalone subprocess can pick it up."""
+    state = {
+        "default_index": _search_ui.default_index,
+        "suggestion_meta_by_index": _search_ui.suggestion_meta_by_index,
+    }
+    try:
+        _UI_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _maybe_reload_ui_state() -> None:
+    """Reload UI state from disk if the state file was updated externally."""
+    global _ui_state_mtime
+    try:
+        mtime = _UI_STATE_FILE.stat().st_mtime
+    except OSError:
+        return
+    if mtime <= _ui_state_mtime:
+        return
+    try:
+        state = json.loads(_UI_STATE_FILE.read_text(encoding="utf-8"))
+        _search_ui.default_index = state.get("default_index", "")
+        _search_ui.suggestion_meta_by_index = state.get("suggestion_meta_by_index", {})
+        _ui_state_mtime = mtime
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+
+
+def _ensure_ui_runtime_dir() -> None:
+    try:
+        _UI_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        if hasattr(os, "chmod"):
+            os.chmod(_UI_RUNTIME_DIR, 0o700)
+    except OSError:
+        pass
+
+
+def _read_ui_lock() -> dict[str, object] | None:
+    try:
+        raw = _UI_LOCK_FILE.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return None
+
+
+def _write_ui_lock(payload: dict[str, object]) -> None:
+    _ensure_ui_runtime_dir()
+    tmp_file = _UI_LOCK_FILE.with_suffix(_UI_LOCK_FILE.suffix + ".tmp")
+    try:
+        tmp_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_file.replace(_UI_LOCK_FILE)
+    except OSError:
+        try:
+            tmp_file.unlink()
+        except OSError:
+            pass
+
+
+def _remove_ui_lock() -> None:
+    try:
+        _UI_LOCK_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _configure_ui_server_runtime(
+    instance_id: str = "",
+    idle_timeout_seconds: int = SEARCH_UI_IDLE_TIMEOUT_SECONDS,
+) -> None:
+    global _ui_instance_id, _ui_idle_timeout_seconds
+    normalized_instance = str(instance_id or "").strip()
+    try:
+        timeout_val = int(idle_timeout_seconds or SEARCH_UI_IDLE_TIMEOUT_SECONDS)
+    except (TypeError, ValueError):
+        timeout_val = SEARCH_UI_IDLE_TIMEOUT_SECONDS
+    _ui_instance_id = normalized_instance
+    _ui_idle_timeout_seconds = max(60, timeout_val)
+
+
+def _register_ui_server_lock() -> None:
+    """Register the current process as the owned standalone UI server.
+
+    Lock file shape (example):
+    {
+      "pid": 12345,
+      "uid": 501,
+      "username": "kaituo",
+      "port": 8765,
+      "project_root": "/Users/kaituo/code/poc/agent-poc",
+      "instance_id": "7d5c...",
+      "started_epoch": 1739999999.12,
+      "last_active_epoch": 1739999999.12
+    }
+
+    The lock file is stored under a user-scoped runtime directory with mode 0700.
+    """
+    global _ui_last_active_epoch
+    now = time.time()
+    _ui_last_active_epoch = now
+    lock_payload = {
+        "service": _SEARCH_UI_SERVICE_NAME,
+        "pid": os.getpid(),
+        "uid": _CURRENT_UID,
+        "username": _CURRENT_USERNAME,
+        "port": SEARCH_UI_PORT,
+        "host": SEARCH_UI_HOST,
+        "project_root": str(Path(__file__).resolve().parent.parent),
+        "script_path": _UI_SERVER_SCRIPT_PATH,
+        "instance_id": _ui_instance_id,
+        "started_epoch": now,
+        "last_active_epoch": now,
+        "idle_timeout_seconds": _ui_idle_timeout_seconds,
+    }
+    _write_ui_lock(lock_payload)
+
+
+def _clear_ui_server_lock_if_owned_by_current_process() -> None:
+    """Remove lock file only when it belongs to this exact process instance.
+
+    Why this exists:
+    - PID alone is not safe because PIDs can be reused.
+    - A lock file must represent process ownership, not just a port.
+
+    Ownership pattern used by this module:
+    1. `uid` + user-private lock location differentiates OS users.
+    2. `pid` must still be alive.
+    3. Command must match the UI server script.
+    4. `instance_id` must match the launched server instance.
+    5. (Optional conceptual check) process start time should match lock start time.
+
+    This specific cleanup helper is intentionally strict and local: it only unlinks
+    the lock when the lock points to *this* process (`pid` + `instance_id` match).
+    Broader ownership validation for reuse/stop is handled in
+    `_is_owned_ui_process()`.
+    """
+    lock = _read_ui_lock()
+    if not lock:
+        return
+    try:
+        lock_pid = int(lock.get("pid", 0))
+    except (TypeError, ValueError):
+        return
+    lock_instance_id = str(lock.get("instance_id", "")).strip()
+    if lock_pid != os.getpid():
+        return
+    if _ui_instance_id and lock_instance_id and lock_instance_id != _ui_instance_id:
+        return
+    _remove_ui_lock()
+
+
+def _record_ui_activity() -> None:
+    global _ui_last_active_epoch
+    now = time.time()
+    _ui_last_active_epoch = now
+
+    lock = _read_ui_lock()
+    if not lock:
+        return
+    try:
+        lock_pid = int(lock.get("pid", 0))
+    except (TypeError, ValueError):
+        return
+    lock_instance_id = str(lock.get("instance_id", "")).strip()
+    if lock_pid != os.getpid():
+        return
+    if _ui_instance_id and lock_instance_id and lock_instance_id != _ui_instance_id:
+        return
+
+    lock["last_active_epoch"] = now
+    if _ui_idle_timeout_seconds:
+        lock["idle_timeout_seconds"] = _ui_idle_timeout_seconds
+    _write_ui_lock(lock)
+
+
+def _should_ui_server_auto_stop(now: float | None = None) -> bool:
+    if _ui_idle_timeout_seconds <= 0:
+        return False
+    reference = now if now is not None else time.time()
+    last_active = _ui_last_active_epoch or reference
+    return (reference - last_active) >= _ui_idle_timeout_seconds
+
+
+def _list_listener_pids_on_ui_port() -> list[int]:
+    try:
+        result = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{SEARCH_UI_PORT}", "-sTCP:LISTEN", "-t"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return []
+
+    pids: list[int] = []
+    for token in result.stdout.strip().split():
+        if not token.strip().isdigit():
+            continue
+        pid = int(token)
+        if pid == os.getpid():
+            continue
+        pids.append(pid)
+    return sorted(set(pids))
+
+
+def _is_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0:
+            state = result.stdout.strip().upper()
+            if state.startswith("Z"):
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def _get_process_command(pid: int) -> str:
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _get_lock_pid(lock: dict[str, object]) -> int:
+    try:
+        return int(lock.get("pid", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_owned_ui_process(lock: dict[str, object] | None) -> tuple[bool, str]:
+    """Validate that a lock points to an owned Search UI server process.
+
+    Conceptual ownership policy:
+    - `lock.uid == os.getuid()` (user boundary)
+    - `lock.pid` is alive
+    - command line contains `ui_server_standalone.py`
+    - command line contains the expected `instance_id`
+    - optional hardening: process start time equals lock start time
+
+    Kill/reuse policy downstream:
+    - all checks pass: safe to reuse/stop
+    - checks fail but port is occupied: do not kill, return conflict guidance
+    - lock exists but pid is dead: treat as stale lock and remove it
+    """
+    if not lock:
+        return False, "lock file missing"
+
+    lock_port = lock.get("port")
+    if isinstance(lock_port, int) and lock_port != SEARCH_UI_PORT:
+        return False, "lock port mismatch"
+
+    lock_uid = lock.get("uid")
+    if (
+        isinstance(lock_uid, int)
+        and _CURRENT_UID is not None
+        and lock_uid != _CURRENT_UID
+    ):
+        return False, "uid mismatch"
+
+    pid = _get_lock_pid(lock)
+    if pid <= 0:
+        return False, "invalid lock pid"
+    if not _is_pid_running(pid):
+        return False, "lock pid not running"
+
+    cmd = _get_process_command(pid)
+    if not cmd:
+        return False, "cannot inspect process command"
+    if _UI_SERVER_SCRIPT_NAME not in cmd:
+        return False, "process command mismatch"
+
+    instance_id = str(lock.get("instance_id", "")).strip()
+    if instance_id and instance_id not in cmd:
+        return False, "instance id mismatch"
+
+    return True, ""
+
+
+def _cleanup_stale_ui_lock() -> bool:
+    lock = _read_ui_lock()
+    if not lock:
+        return False
+    pid = _get_lock_pid(lock)
+    if pid > 0 and _is_pid_running(pid):
+        return False
+    _remove_ui_lock()
+    return True
+
+
+def _read_ui_health(timeout_seconds: float = 2.0) -> dict[str, object] | None:
+    try:
+        url = f"http://{SEARCH_UI_HOST}:{SEARCH_UI_PORT}/api/health"
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            if resp.status != 200:
+                return None
+            payload = json.loads(resp.read().decode("utf-8"))
+            if isinstance(payload, dict):
+                return payload
+    except Exception:
+        return None
+    return None
+
+
+def _is_ui_server_responsive(expected_instance_id: str = "") -> bool:
+    """Return True if the search UI server is healthy and is our UI service."""
+    payload = _read_ui_health(timeout_seconds=2.0)
+    if not payload:
+        return False
+    if payload.get("service") != _SEARCH_UI_SERVICE_NAME:
+        return False
+    if not bool(payload.get("ok", False)):
+        return False
+    expected = str(expected_instance_id or "").strip()
+    if expected and str(payload.get("instance_id", "")).strip() != expected:
+        return False
+    return True
 
 
 def _parse_id_list(raw_ids: str) -> list[str]:
@@ -3300,6 +3683,147 @@ def _search_ui_public_url() -> str:
     return f"http://{public_host}:{SEARCH_UI_PORT}"
 
 
+def _coerce_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _coerce_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_epoch(epoch: float) -> str:
+    if epoch <= 0:
+        return "-"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+    except Exception:
+        return "-"
+
+
+def _format_duration(seconds: int | None) -> str:
+    if seconds is None:
+        return "-"
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours > 0:
+        return f"{hours}h {minutes:02d}m {secs:02d}s"
+    if minutes > 0:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _search_ui_status_snapshot() -> dict[str, object]:
+    now = time.time()
+    lock = _read_ui_lock()
+
+    status: dict[str, object] = {
+        "status": "stopped",
+        "url": _search_ui_public_url(),
+        "pid": None,
+        "last_active_epoch": 0.0,
+        "last_active": "-",
+        "idle_timeout_seconds": SEARCH_UI_IDLE_TIMEOUT_SECONDS,
+        "auto_stop_in_seconds": None,
+        "owned": False,
+        "note": "UI server is not running.",
+    }
+
+    if not lock:
+        listeners = _list_listener_pids_on_ui_port()
+        if listeners:
+            status["note"] = (
+                f"Port {SEARCH_UI_PORT} is occupied by pid {listeners[0]} "
+                "(ownership check failed)."
+            )
+        return status
+
+    pid = _get_lock_pid(lock)
+    owned, owned_reason = _is_owned_ui_process(lock)
+
+    last_active_epoch = _coerce_float(lock.get("last_active_epoch"), 0.0)
+    idle_timeout_seconds = max(
+        60,
+        _coerce_int(lock.get("idle_timeout_seconds"), SEARCH_UI_IDLE_TIMEOUT_SECONDS),
+    )
+    auto_stop_in_seconds: int | None = None
+    if last_active_epoch > 0:
+        auto_stop_in_seconds = max(0, idle_timeout_seconds - int(now - last_active_epoch))
+
+    status.update(
+        {
+            "pid": pid if pid > 0 else None,
+            "instance_id": str(lock.get("instance_id", "")).strip(),
+            "last_active_epoch": last_active_epoch,
+            "last_active": _format_epoch(last_active_epoch),
+            "idle_timeout_seconds": idle_timeout_seconds,
+            "auto_stop_in_seconds": auto_stop_in_seconds,
+            "owned": owned,
+        }
+    )
+
+    if owned:
+        status["status"] = "running"
+        status["note"] = "Owned UI server is running."
+        return status
+
+    if owned_reason == "lock pid not running":
+        status["note"] = "UI lock file is stale."
+    else:
+        status["note"] = f"UI lock ownership check failed: {owned_reason}."
+    return status
+
+
+def _format_ui_status_line(status: dict[str, object]) -> str:
+    state = str(status.get("status", "stopped"))
+    pid = status.get("pid")
+    last_active = str(status.get("last_active", "-"))
+    auto_stop = _format_duration(status.get("auto_stop_in_seconds"))
+    return (
+        f"UI server status: {state} | pid: {pid if pid else '-'} | "
+        f"last_active: {last_active} | auto-stop in: {auto_stop}"
+    )
+
+
+def _terminate_process(pid: int, timeout_seconds: float = 3.0) -> tuple[bool, bool]:
+    """Terminate process by pid. Returns (stopped, used_sigkill)."""
+    import signal
+
+    if pid <= 0:
+        return False, False
+    if not _is_pid_running(pid):
+        return True, False
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        return (not _is_pid_running(pid), False)
+
+    deadline = time.time() + max(0.1, timeout_seconds)
+    while time.time() < deadline:
+        if not _is_pid_running(pid):
+            return True, False
+        time.sleep(0.1)
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        return not _is_pid_running(pid), False
+
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        if not _is_pid_running(pid):
+            return True, True
+        time.sleep(0.05)
+    return False, True
+
+
 def _resolve_search_ui_asset(path: str) -> Path | None:
     normalized = path.strip()
     if normalized in {"", "/"}:
@@ -3343,11 +3867,26 @@ class _SearchUIRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_GET(self) -> None:  # noqa: N802
+        _maybe_reload_ui_state()
+        _record_ui_activity()
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
 
         if parsed.path == "/api/health":
-            self._write_json({"ok": True, "default_index": _search_ui.default_index})
+            status = _search_ui_status_snapshot()
+            self._write_json(
+                {
+                    "ok": True,
+                    "service": _SEARCH_UI_SERVICE_NAME,
+                    "default_index": _search_ui.default_index,
+                    "instance_id": _ui_instance_id or status.get("instance_id", ""),
+                    "pid": os.getpid(),
+                    "status": status.get("status", "running"),
+                    "last_active_epoch": status.get("last_active_epoch", 0.0),
+                    "idle_timeout_seconds": status.get("idle_timeout_seconds", SEARCH_UI_IDLE_TIMEOUT_SECONDS),
+                    "auto_stop_in_seconds": status.get("auto_stop_in_seconds"),
+                }
+            )
             return
 
         if parsed.path == "/api/config":
@@ -3433,7 +3972,26 @@ class _SearchUIRequestHandler(BaseHTTPRequestHandler):
         return
 
 
-def _start_search_ui_server(preferred_index: str = "") -> str:
+def _kill_stale_ui_on_port() -> bool:
+    """Kill stale UI process only when lock ownership verification passes."""
+    lock = _read_ui_lock()
+    owned, _ = _is_owned_ui_process(lock)
+    if not owned or not lock:
+        return False
+
+    pid = _get_lock_pid(lock)
+    listeners = _list_listener_pids_on_ui_port()
+    if listeners and pid not in listeners:
+        return False
+
+    stopped, _ = _terminate_process(pid)
+    if stopped:
+        _remove_ui_lock()
+        return True
+    return False
+
+
+def _ensure_search_ui_server(preferred_index: str = "") -> dict[str, object]:
     with _search_ui.lock:
         if not SEARCH_UI_STATIC_DIR.exists():
             raise RuntimeError(f"Search UI static directory not found: {SEARCH_UI_STATIC_DIR}")
@@ -3444,17 +4002,91 @@ def _start_search_ui_server(preferred_index: str = "") -> str:
         if resolved_index:
             _search_ui.default_index = resolved_index
 
-        if _search_ui.server is not None and _search_ui.thread is not None:
-            if _search_ui.thread.is_alive():
-                return _search_ui_public_url()
+        _write_ui_state()
 
-        server = ThreadingHTTPServer((SEARCH_UI_HOST, SEARCH_UI_PORT), _SearchUIRequestHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        _search_ui.server = server
-        _search_ui.thread = thread
+        _cleanup_stale_ui_lock()
 
-    return _search_ui_public_url()
+        lock = _read_ui_lock()
+        owned, _ = _is_owned_ui_process(lock)
+        if owned and lock:
+            instance_id = str(lock.get("instance_id", "")).strip()
+            if _is_ui_server_responsive(expected_instance_id=instance_id):
+                status = _search_ui_status_snapshot()
+                status["note"] = "Reused existing owned UI server."
+                return {
+                    "url": _search_ui_public_url(),
+                    "action": "reused",
+                    "status": status,
+                }
+
+        if _is_ui_server_responsive():
+            listeners = _list_listener_pids_on_ui_port()
+            pid_note = f"pid {listeners[0]}" if listeners else "an existing process"
+            raise RuntimeError(
+                f"Search UI port {SEARCH_UI_PORT} is already serving requests via {pid_note}, "
+                "but ownership check failed. Not terminating that process. "
+                "Stop it manually or set SEARCH_UI_PORT to a free port and retry."
+            )
+
+        _kill_stale_ui_on_port()
+
+        listeners = _list_listener_pids_on_ui_port()
+        if listeners:
+            conflict_pid = listeners[0]
+            conflict_cmd = _get_process_command(conflict_pid)
+            raise RuntimeError(
+                f"Search UI port {SEARCH_UI_PORT} is in use by pid {conflict_pid} "
+                f"({conflict_cmd or 'unknown command'}). Ownership check failed, "
+                "so the process was not terminated. Stop that process or set "
+                "SEARCH_UI_PORT to another free port."
+            )
+
+        server_script = str(Path(__file__).resolve().parent / "ui_server_standalone.py")
+        project_root = str(Path(__file__).resolve().parent.parent)
+        instance_id = uuid.uuid4().hex
+        subprocess.Popen(
+            [
+                sys.executable,
+                server_script,
+                "--instance-id",
+                instance_id,
+                "--idle-timeout-seconds",
+                str(SEARCH_UI_IDLE_TIMEOUT_SECONDS),
+            ],
+            cwd=project_root,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+
+        _search_ui.server = None
+        _search_ui.thread = None
+
+        started = False
+        for _ in range(24):
+            time.sleep(0.25)
+            if _is_ui_server_responsive(expected_instance_id=instance_id):
+                started = True
+                break
+
+        if not started:
+            raise RuntimeError(
+                f"Search UI failed to become healthy on port {SEARCH_UI_PORT}. "
+                "Check whether another process is occupying the port, then retry."
+            )
+
+        status = _search_ui_status_snapshot()
+        status["note"] = "Started new owned UI server."
+        return {
+            "url": _search_ui_public_url(),
+            "action": "started",
+            "status": status,
+        }
+
+
+def _start_search_ui_server(preferred_index: str = "") -> str:
+    return str(_ensure_search_ui_server(preferred_index).get("url", _search_ui_public_url()))
 
 PRETRAINED_MODELS = {
     "huggingface/cross-encoders/ms-marco-MiniLM-L-12-v2": "1.0.2",
@@ -3700,7 +4332,7 @@ def create_bedrock_embedding_model(model_name: str) -> str:
         connector_id = response.get("connector_id")
         if not connector_id:
             return f"Failed to create connector: {response}"
-        print(f"Connector created: {connector_id}")
+        print(f"Connector created: {connector_id}", file=sys.stderr)
 
         # 2. Register Model
         register_body = {
@@ -3711,7 +4343,7 @@ def create_bedrock_embedding_model(model_name: str) -> str:
         }
         response = opensearch_client.transport.perform_request("POST", "/_plugins/_ml/models/_register", body=register_body)
         task_id = response.get("task_id")
-        print(f"Model registration task started: {task_id}")
+        print(f"Model registration task started: {task_id}", file=sys.stderr)
         
         # Poll for model ID
         model_id = None
@@ -3727,12 +4359,12 @@ def create_bedrock_embedding_model(model_name: str) -> str:
             
         if not model_id:
             return "Model registration timed out or failed."
-        print(f"Model registered: {model_id}")
+        print(f"Model registered: {model_id}", file=sys.stderr)
 
         # 3. Deploy Model
         response = opensearch_client.transport.perform_request("POST", f"/_plugins/_ml/models/{model_id}/_deploy")
         deploy_task_id = response.get("task_id")
-        print(f"Model deployment task started: {deploy_task_id}")
+        print(f"Model deployment task started: {deploy_task_id}", file=sys.stderr)
         
         # Poll for deployment
         for _ in range(100):
@@ -4133,7 +4765,7 @@ def create_local_pretrained_model(model_name: str) -> str:
     try:
         opensearch_client = _create_client()
         # use red font to print the model_name
-        print(f"\033[91m[create_local_pretrained_model] Model name: {model_name}\033[0m")
+        print(f"\033[91m[create_local_pretrained_model] Model name: {model_name}\033[0m", file=sys.stderr)
         if model_name not in PRETRAINED_MODELS:
             return f"Error: Model '{model_name}' not supported. Supported models: {list(PRETRAINED_MODELS.keys())}"
             
@@ -4150,7 +4782,7 @@ def create_local_pretrained_model(model_name: str) -> str:
         }
         response = opensearch_client.transport.perform_request("POST", "/_plugins/_ml/models/_register", body=register_body)
         task_id = response.get("task_id")
-        print(f"Model registration task started: {task_id}")
+        print(f"Model registration task started: {task_id}", file=sys.stderr)
         
         # Poll for model ID
         model_id = None
@@ -4166,12 +4798,12 @@ def create_local_pretrained_model(model_name: str) -> str:
             
         if not model_id:
             return "Model registration timed out or failed."
-        print(f"Model registered: {model_id}")
+        print(f"Model registered: {model_id}", file=sys.stderr)
 
         # 2. Deploy Model
         response = opensearch_client.transport.perform_request("POST", f"/_plugins/_ml/models/{model_id}/_deploy")
         deploy_task_id = response.get("task_id")
-        print(f"Model deployment task started: {deploy_task_id}")
+        print(f"Model deployment task started: {deploy_task_id}", file=sys.stderr)
         
         # Poll for deployment
         for _ in range(100):  # Increase timeout for deployment
@@ -4283,21 +4915,79 @@ def index_verification_docs(
 def launch_search_ui(index_name: str = "") -> str:
     """Launch local React Search Builder UI for interactive testing."""
     try:
-        url = _start_search_ui_server(index_name)
+        launch = _ensure_search_ui_server(index_name)
+        url = str(launch.get("url", _search_ui_public_url()))
+        action = str(launch.get("action", "started"))
+        status = launch.get("status")
+        if not isinstance(status, dict):
+            status = _search_ui_status_snapshot()
         selected_index = _resolve_default_index(index_name)
     except Exception as e:
         return f"Failed to launch Search Builder UI: {e}"
 
+    action_line = (
+        f"Reusing existing server at: {url}"
+        if action == "reused"
+        else f"Started new Search Builder UI server at: {url}"
+    )
+    status_line = _format_ui_status_line(status)
+
     if selected_index:
         return (
-            f"Search Builder UI is running at: {url}\n"
+            f"{action_line}\n"
             f"Default index: {selected_index}\n"
+            f"{status_line}\n"
             "You can run queries immediately and inspect returned documents."
         )
     return (
-        f"Search Builder UI is running at: {url}\n"
+        f"{action_line}\n"
+        f"{status_line}\n"
         "No default index selected. Enter an index name in the UI to start searching."
     )
+
+
+def cleanup_ui_server() -> str:
+    """Stop the standalone Search Builder UI server if ownership checks pass."""
+    with _search_ui.lock:
+        _cleanup_stale_ui_lock()
+        lock = _read_ui_lock()
+        owned, owned_reason = _is_owned_ui_process(lock)
+
+        if owned and lock:
+            pid = _get_lock_pid(lock)
+            stopped, used_sigkill = _terminate_process(pid)
+            if stopped:
+                _remove_ui_lock()
+                status = _search_ui_status_snapshot()
+                mode = "force-killed" if used_sigkill else "stopped"
+                return (
+                    f"Search Builder UI server {mode} successfully.\n"
+                    f"{_format_ui_status_line(status)}"
+                )
+            status = _search_ui_status_snapshot()
+            return (
+                f"Failed to stop Search Builder UI server pid {pid}.\n"
+                f"{_format_ui_status_line(status)}"
+            )
+
+        listeners = _list_listener_pids_on_ui_port()
+        if listeners:
+            conflict_pid = listeners[0]
+            conflict_cmd = _get_process_command(conflict_pid)
+            status = _search_ui_status_snapshot()
+            return (
+                f"Did not stop process on port {SEARCH_UI_PORT}. Ownership check failed"
+                f" ({owned_reason or 'lock missing'}).\n"
+                f"Port owner: pid {conflict_pid} ({conflict_cmd or 'unknown command'}).\n"
+                f"{_format_ui_status_line(status)}"
+            )
+
+        _remove_ui_lock()
+        status = _search_ui_status_snapshot()
+        return (
+            "Search Builder UI server is already stopped.\n"
+            f"{_format_ui_status_line(status)}"
+        )
 
 
 def set_search_ui_suggestions(index_name: str, suggestion_meta_json: str) -> str:
@@ -4321,6 +5011,7 @@ def set_search_ui_suggestions(index_name: str, suggestion_meta_json: str) -> str
     if not isinstance(parsed, list):
         return "suggestion_meta_json must be a JSON array."
     _search_ui.suggestion_meta_by_index[target] = parsed
+    _write_ui_state()
     return f"Set {len(parsed)} suggestions for index '{target}'."
 
 
