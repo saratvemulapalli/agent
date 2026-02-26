@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "opensearch-orchestrator": {
+      "command": "uvx",
+      "args": [
+        "opensearch-orchestrator@latest"
+      ],
+      "env": {
+        "AWS_PROFILE": "default",
+        "AWS_REGION": "us-east-1",
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
