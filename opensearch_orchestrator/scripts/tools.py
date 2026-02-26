@@ -4,13 +4,14 @@ import re
 import csv
 import math
 import sys
+from importlib import resources as importlib_resources
 from typing import Any, Dict, Optional
 from pathlib import Path
 from html import unescape
 from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 
-from scripts.shared import (
+from opensearch_orchestrator.scripts.shared import (
     SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX,
     SUPPORTED_SAMPLE_FILE_FORMATS_COMMA,
     text_richness_score,
@@ -25,6 +26,42 @@ _INLINE_RELATIVE_PATH_WITH_SUPPORTED_EXTENSION_PATTERN = re.compile(
     rf"(?:\./|\../)?[^\s,;]+(?:{SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX})\b",
     flags=re.IGNORECASE,
 )
+
+BUILTIN_IMDB_SAMPLE_PATH = "opensearch_orchestrator/scripts/sample_data/imdb.title.basics.tsv"
+_LEGACY_BUILTIN_IMDB_SAMPLE_PATH = "scripts/sample_data/imdb.title.basics.tsv"
+_KNOWLEDGE_PACKAGE_ROOT = ("scripts", "knowledge")
+_SAMPLE_DATA_PACKAGE_ROOT = ("scripts", "sample_data")
+
+
+def _read_packaged_text_file(*parts: str) -> str:
+    return importlib_resources.files("opensearch_orchestrator").joinpath(*parts).read_text(
+        encoding="utf-8"
+    )
+
+
+def _looks_like_builtin_imdb_path(path_text: str) -> bool:
+    normalized = (path_text or "").strip().strip('"').strip("'")
+    return normalized in {BUILTIN_IMDB_SAMPLE_PATH, _LEGACY_BUILTIN_IMDB_SAMPLE_PATH}
+
+
+def _resolve_builtin_imdb_sample_file() -> Path:
+    # Installed wheels are unpacked to site-packages, so this resolves to a real file.
+    candidate = Path(__file__).resolve().parent / "sample_data" / "imdb.title.basics.tsv"
+    if candidate.exists():
+        return candidate
+    # Fallback for unusual import loaders where __file__ path differs.
+    traversable = importlib_resources.files("opensearch_orchestrator").joinpath(
+        *_SAMPLE_DATA_PACKAGE_ROOT, "imdb.title.basics.tsv"
+    )
+    return Path(str(traversable))
+
+
+def _resolve_source_local_file_path(source_local_file: str) -> Path | None:
+    if not source_local_file:
+        return None
+    if _looks_like_builtin_imdb_path(source_local_file):
+        return _resolve_builtin_imdb_sample_file()
+    return Path(source_local_file)
 
 
 def normalize_ingest_source_field_hints(
@@ -63,13 +100,10 @@ def read_knowledge_base() -> str:
         str: The content of the guide covering BM25, Dense Vector, Sparse Vector, Hybrid, algorithms (HNSW, IVF, etc.), cost profiles, and deployment options.
     """
     try:
-        # Assuming the file is in the same directory or accessible via relative path
-        # Since this script is in scripts/ folder, we need to go one level up if run from there, 
-        # or if run from root (as module), it depends on CWD.
-        # But typically we run from root.
-        filename = "scripts/knowledge/opensearch_semantic_search_guide.md"
-        with open(filename, "r", encoding="utf-8") as f:
-            return f.read()
+        return _read_packaged_text_file(
+            *_KNOWLEDGE_PACKAGE_ROOT,
+            "opensearch_semantic_search_guide.md",
+        )
     except Exception as e:
         return f"Error reading knowledge base: {e}"
 
@@ -81,9 +115,10 @@ def read_dense_vector_models() -> str:
         str: The content of the guide covering models for OpenSearch Node, SageMaker GPU, and External API services.
     """
     try:
-        filename = "scripts/knowledge/dense_vector_models.md"
-        with open(filename, "r", encoding="utf-8") as f:
-            return f.read()
+        return _read_packaged_text_file(
+            *_KNOWLEDGE_PACKAGE_ROOT,
+            "dense_vector_models.md",
+        )
     except Exception as e:
         return f"Error reading dense vector models guide: {e}"
 
@@ -95,9 +130,10 @@ def read_sparse_vector_models() -> str:
         str: The content of the guide covering models for Doc-Only and Bi-Encoder modes.
     """
     try:
-        filename = "scripts/knowledge/sparse_vector_models.md"
-        with open(filename, "r", encoding="utf-8") as f:
-            return f.read()
+        return _read_packaged_text_file(
+            *_KNOWLEDGE_PACKAGE_ROOT,
+            "sparse_vector_models.md",
+        )
     except Exception as e:
         return f"Error reading sparse vector models guide: {e}"
 
@@ -980,7 +1016,9 @@ def get_sample_docs_payload(
             )
 
     if source_local_file:
-        file_path = Path(source_local_file)
+        file_path = _resolve_source_local_file_path(source_local_file)
+        if file_path is None:
+            file_path = Path(source_local_file)
         if file_path.exists() and file_path.is_file():
             docs, _ = _load_records_from_local_file(file_path, effective_limit)
             if docs:
@@ -1043,7 +1081,12 @@ def submit_sample_doc_from_local_file(
     if not resolved_text:
         return "Error: could not detect a local file path."
 
-    source_path = Path(resolved_text)
+    source_display_path = resolved_text
+    if _looks_like_builtin_imdb_path(resolved_text):
+        source_path = _resolve_builtin_imdb_sample_file()
+        source_display_path = BUILTIN_IMDB_SAMPLE_PATH
+    else:
+        source_path = Path(resolved_text)
     if not source_path.exists():
         return f"Error: local path not found: {source_path}"
 
@@ -1095,15 +1138,20 @@ def submit_sample_doc_from_local_file(
         "infer language strategy from observed content unless the user specifies otherwise."
     )
     status = (
-        f"Sample document loaded from '{file_path}'. "
+        f"Sample document loaded from '{source_display_path if source_display_path == BUILTIN_IMDB_SAMPLE_PATH else file_path}'. "
         f"Detected fields: {field_preview}.{directory_note} "
         f"Data profile: {count_note} Language hint: {language_note} {scope_note}"
+    )
+    source_local_file = (
+        BUILTIN_IMDB_SAMPLE_PATH
+        if source_display_path == BUILTIN_IMDB_SAMPLE_PATH
+        else str(file_path)
     )
     return json.dumps(
         {
             "status": status,
             "sample_doc": parsed_doc,
-            "source_local_file": str(file_path),
+            "source_local_file": source_local_file,
         },
         ensure_ascii=False,
     )

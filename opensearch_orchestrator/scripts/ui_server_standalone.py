@@ -10,17 +10,11 @@ The UI server at http://127.0.0.1:8765 now stays up even after the MCP server
 """
 import argparse
 import signal
-import sys
 import threading
-from pathlib import Path
-
-_project_root = str(Path(__file__).resolve().parent.parent)
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
 
 from http.server import ThreadingHTTPServer  # noqa: E402
 
-from scripts.opensearch_ops_tools import (  # noqa: E402
+from opensearch_orchestrator.scripts.opensearch_ops_tools import (  # noqa: E402
     SEARCH_UI_HOST,
     SEARCH_UI_IDLE_TIMEOUT_SECONDS,
     SEARCH_UI_PORT,

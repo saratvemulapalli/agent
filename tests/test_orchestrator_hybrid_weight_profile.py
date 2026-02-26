@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import orchestrator
+import opensearch_orchestrator.orchestrator as orchestrator
 
 
 def test_build_hybrid_weight_profile_note_normalizes_unknown_to_balanced():

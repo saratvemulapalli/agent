@@ -3,7 +3,10 @@
     "opensearch-orchestrator": {
       "command": "uv",
       "args": ["run", "opensearch_orchestrator/mcp_server.py"],
-      "cwd": "/path/to/agent-poc"
+      "cwd": "/Users/kaituo/code/poc/agent-poc",
+      "env": {
+        "AWS_PROFILE": "bedrock"
+      }
     }
   }
 }

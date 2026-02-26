@@ -8,7 +8,7 @@ performs one agent turn and returns the response immediately.
 
 import re
 
-from solution_planning_assistant import (
+from opensearch_orchestrator.solution_planning_assistant import (
     _create_planner_agent,
     _extract_canonical_capability_ids,
     _extract_localhost_source_index_name,
@@ -22,8 +22,8 @@ from solution_planning_assistant import (
     _build_capability_precheck_feedback,
     _looks_like_planner_confirmation,
 )
-from scripts.opensearch_ops_tools import preview_capability_driven_verification
-from scripts.shared import looks_like_new_request, looks_like_execution_intent
+from opensearch_orchestrator.scripts.opensearch_ops_tools import preview_capability_driven_verification
+from opensearch_orchestrator.scripts.shared import looks_like_new_request, looks_like_execution_intent
 
 
 class PlanningSession:

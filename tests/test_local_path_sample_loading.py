@@ -6,15 +6,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import scripts.tools as tools
-from scripts.tools import (
+import opensearch_orchestrator.scripts.tools as tools
+from opensearch_orchestrator.scripts.tools import (
     _extract_path_candidate,
     _extract_index_candidate,
     get_sample_docs_payload,
     submit_sample_doc_from_local_file,
     submit_sample_doc_from_localhost_index,
 )
-from scripts.shared import (
+from opensearch_orchestrator.scripts.shared import (
     looks_like_builtin_imdb_sample_request,
     looks_like_local_path_message,
     looks_like_localhost_index_message,

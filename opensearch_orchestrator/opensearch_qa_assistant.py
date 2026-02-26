@@ -4,8 +4,16 @@ import re
 
 from strands import Agent, tool
 from strands.models import BedrockModel
-from scripts.handler import ThinkingCallbackHandler
-from scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models, search_opensearch_org
+if __package__ in {None, ""}:
+    from pathlib import Path
+    import sys
+
+    _SCRIPT_EXECUTION_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+    if _SCRIPT_EXECUTION_PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _SCRIPT_EXECUTION_PROJECT_ROOT)
+
+from opensearch_orchestrator.scripts.handler import ThinkingCallbackHandler
+from opensearch_orchestrator.scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models, search_opensearch_org
 
 # -------------------------------------------------------------------------
 # System Prompt

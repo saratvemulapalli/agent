@@ -7,7 +7,7 @@ There are two ways to use the agent: as a **standalone interactive CLI** or via 
 Start the interactive orchestrator in a terminal:
 
 ```bash
-python orchestrator.py
+python opensearch_orchestrator/orchestrator.py
 ```
 
 The orchestrator guides you through sample collection, requirements gathering, solution planning, and execution — all in one interactive session.
@@ -27,15 +27,29 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ### Running manually
 
 ```bash
-uv run mcp_server.py
+uv run opensearch_orchestrator/mcp_server.py
 ```
 
-`uv` reads the inline script metadata in `mcp_server.py` and auto-installs `mcp` and `opensearch-py` into a cached virtual environment.
+`uv` reads the inline script metadata in `opensearch_orchestrator/mcp_server.py` and auto-installs dependencies into a cached virtual environment.
+
+### Running from PyPI (`uvx`)
+
+After publishing to PyPI, run the MCP server without cloning the repo:
+
+```bash
+uvx opensearch-orchestrator@latest
+```
+
+If you install via `pip`, you can also run:
+
+```bash
+opensearch-orchestrator
+```
 
 Important: this command starts a stdio MCP server (JSON-RPC), not an interactive CLI. It should be launched by an MCP client such as Cursor, Claude Desktop, or MCP Inspector. If you want an interactive terminal workflow, run:
 
 ```bash
-python orchestrator.py
+python opensearch_orchestrator/orchestrator.py
 ```
 
 ### MCP workflow tools
@@ -64,7 +78,7 @@ Low-level domain tools (`create_index`, `submit_sample_doc`, etc.) are also expo
   "mcpServers": {
     "opensearch-orchestrator": {
       "command": "uv",
-      "args": ["run", "mcp_server.py"],
+      "args": ["run", "opensearch_orchestrator/mcp_server.py"],
       "cwd": "/path/to/agent-poc"
     }
   }
@@ -105,9 +119,26 @@ pip install mcp opensearch-py
   "mcpServers": {
     "opensearch-orchestrator": {
       "command": "python3",
-      "args": ["mcp_server.py"],
+      "args": ["opensearch_orchestrator/mcp_server.py"],
       "cwd": "/path/to/agent-poc"
     }
   }
 }
 ```
+
+## Release checklist
+
+Build and validate before publishing:
+
+```bash
+uv run pytest -q
+uv build
+python -m zipfile -l dist/*.whl
+python -c "import opensearch_orchestrator.mcp_server as m; print(hasattr(m, 'main'))"
+uvx --from dist/*.whl opensearch-orchestrator
+
+# Upload to PyPI (needs a PyPI account + API token)
+uv publish --token pypi-YOUR-TOKEN
+```
+
+Then publish to TestPyPI for smoke tests, followed by PyPI.

@@ -4,7 +4,7 @@
       "command": "uv",
       "args": [
         "run",
-        "mcp_server.py"
+        "opensearch_orchestrator/mcp_server.py"
       ],
       "cwd": "/Users/kaituo/code/poc/agent-poc",
       "env": {

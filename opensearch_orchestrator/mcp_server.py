@@ -12,6 +12,14 @@ Low-level domain tools are also exposed for advanced use.
 
 from __future__ import annotations
 
+if __package__ in {None, ""}:
+    from pathlib import Path
+    import sys
+
+    _SCRIPT_EXECUTION_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+    if _SCRIPT_EXECUTION_PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _SCRIPT_EXECUTION_PROJECT_ROOT)
+
 import errno
 import json
 import sys
@@ -19,7 +27,7 @@ import sys
 import anyio
 from mcp.server.fastmcp import FastMCP
 
-from orchestrator import (
+from opensearch_orchestrator.orchestrator import (
     SessionState,
     _infer_semantic_text_fields,
     _capture_sample_from_result,
@@ -63,9 +71,10 @@ from orchestrator import (
     _DEFAULT_CUSTOM_REQUIREMENTS_NOTE,
     _RESUME_WORKER_MARKER,
 )
-from planning_session import PlanningSession
-from scripts.shared import Phase, get_last_worker_run_state
-from scripts.tools import (
+from opensearch_orchestrator.planning_session import PlanningSession
+from opensearch_orchestrator.scripts.shared import Phase, get_last_worker_run_state
+from opensearch_orchestrator.scripts.tools import (
+    BUILTIN_IMDB_SAMPLE_PATH,
     submit_sample_doc,
     submit_sample_doc_from_local_file,
     submit_sample_doc_from_localhost_index,
@@ -76,7 +85,7 @@ from scripts.tools import (
     read_sparse_vector_models,
     search_opensearch_org,
 )
-from scripts.opensearch_ops_tools import (
+from opensearch_orchestrator.scripts.opensearch_ops_tools import (
     SEARCH_UI_HOST,
     SEARCH_UI_PORT,
     create_index,
@@ -93,7 +102,7 @@ from scripts.opensearch_ops_tools import (
     cleanup_ui_server,
     set_search_ui_suggestions,
 )
-from worker import worker_agent as worker_agent_impl
+from opensearch_orchestrator.worker import worker_agent as worker_agent_impl
 
 # -------------------------------------------------------------------------
 # Workflow prompt (shared by MCP prompt and Cursor rule)
@@ -227,7 +236,7 @@ def load_sample(source_type: str, source_value: str = "") -> dict:
     _clear_orchestrator_sample_state(state)
 
     if source_type == "builtin_imdb":
-        result = submit_sample_doc_from_local_file("scripts/sample_data/imdb.title.basics.tsv")
+        result = submit_sample_doc_from_local_file(BUILTIN_IMDB_SAMPLE_PATH)
     elif source_type == "local_file":
         if not source_value:
             return {"error": "source_value is required for local_file source_type (provide a file path)."}
@@ -614,16 +623,17 @@ def _is_expected_stdio_disconnect(exc: BaseException) -> bool:
     return True
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Entry point for the MCP server (used by both `uv run` and PyPI console_scripts)."""
     if sys.stdin.isatty():
         print(
             "This MCP server uses JSON-RPC over stdio and must be launched by an MCP client "
             "(Cursor/Claude Desktop/Inspector)."
         )
-        print("For an interactive local workflow, run: python orchestrator.py")
+        print("For an interactive local workflow, run: python opensearch_orchestrator/orchestrator.py")
         raise SystemExit(0)
     # IDE MCP integrations commonly run stdio servers as child processes (for this repo:
-    # clients like Cursor launches `uv run mcp_server.py` from `.cursor/mcp.json`).
+    # clients like Cursor launches `uv run opensearch_orchestrator/mcp_server.py` from `.cursor/mcp.json`).
     # Reconnect-like events (window reload/restart, MCP toggle, cancel/disconnect/re-init)
     # close and reopen the stdio pipe. When that pipe closes, this process should exit
     # cleanly; the client starts a new process for the new connection.
@@ -634,3 +644,7 @@ if __name__ == "__main__":
         if _is_expected_stdio_disconnect(exc):
             raise SystemExit(0)
         raise
+
+
+if __name__ == "__main__":
+    main()

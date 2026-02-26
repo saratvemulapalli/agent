@@ -4,16 +4,30 @@ import sys
 
 from strands import Agent, tool
 from strands.models import BedrockModel
-from scripts.handler import ThinkingCallbackHandler
-from scripts.opensearch_ops_tools import preview_capability_driven_verification
-from scripts.tools import read_knowledge_base, read_dense_vector_models, read_sparse_vector_models, search_opensearch_org
-from scripts.shared import (
+if __package__ in {None, ""}:
+    from pathlib import Path
+    import sys
+
+    _SCRIPT_EXECUTION_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+    if _SCRIPT_EXECUTION_PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _SCRIPT_EXECUTION_PROJECT_ROOT)
+
+from opensearch_orchestrator.scripts.handler import ThinkingCallbackHandler
+from opensearch_orchestrator.scripts.opensearch_ops_tools import preview_capability_driven_verification
+from opensearch_orchestrator.scripts.tools import (
+    BUILTIN_IMDB_SAMPLE_PATH,
+    read_knowledge_base,
+    read_dense_vector_models,
+    read_sparse_vector_models,
+    search_opensearch_org,
+)
+from opensearch_orchestrator.scripts.shared import (
     SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX,
     read_multiline_input,
     looks_like_new_request,
     looks_like_execution_intent,
 )
-from worker import SAMPLE_CONTEXT
+from opensearch_orchestrator.worker import SAMPLE_CONTEXT
 
 # -------------------------------------------------------------------------
 # System Prompt
@@ -329,8 +343,8 @@ def _extract_source_local_file(context: str) -> str:
     if candidate:
         return candidate
 
-    if "scripts/sample_data/imdb.title.basics.tsv" in text:
-        return "scripts/sample_data/imdb.title.basics.tsv"
+    if BUILTIN_IMDB_SAMPLE_PATH in text:
+        return BUILTIN_IMDB_SAMPLE_PATH
     return ""
 
 

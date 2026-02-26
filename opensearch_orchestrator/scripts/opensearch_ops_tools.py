@@ -1,6 +1,6 @@
 from opensearchpy import OpenSearch
 
-from scripts.shared import normalize_text, value_shape, text_richness_score
+from opensearch_orchestrator.scripts.shared import normalize_text, value_shape, text_richness_score
 import getpass
 import json
 import os
@@ -18,7 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from scripts.tools import get_sample_docs_payload, normalize_ingest_source_field_hints
+from opensearch_orchestrator.scripts.tools import get_sample_docs_payload, normalize_ingest_source_field_hints
 
 OPENSEARCH_HOST = os.getenv("OPENSEARCH_HOST", "localhost")
 OPENSEARCH_PORT = int(os.getenv("OPENSEARCH_PORT", "9200"))
@@ -60,6 +60,8 @@ _SEARCH_UI_CONTENT_TYPES = {
     ".svg": "image/svg+xml",
 }
 
+_BOOLEAN_STRING_FLAG_VALUES = {"0", "1", "true", "false", "yes", "no", "y", "n", "t", "f"}
+
 class _SearchUIRuntime:
     def __init__(self) -> None:
         self.server: ThreadingHTTPServer | None = None
@@ -92,7 +94,7 @@ else:
 _UI_RUNTIME_DIR = Path(tempfile.gettempdir()) / f"opensearch_search_ui_{_ui_owner_token}"
 _UI_LOCK_FILE = _UI_RUNTIME_DIR / _UI_LOCK_BASENAME
 _UI_SERVER_SCRIPT_NAME = "ui_server_standalone.py"
-_UI_SERVER_SCRIPT_PATH = str(Path(__file__).resolve().parent / _UI_SERVER_SCRIPT_NAME)
+_UI_SERVER_MODULE = "opensearch_orchestrator.scripts.ui_server_standalone"
 
 _ui_instance_id: str = ""
 _ui_idle_timeout_seconds: int = SEARCH_UI_IDLE_TIMEOUT_SECONDS
@@ -210,8 +212,8 @@ def _register_ui_server_lock() -> None:
         "username": _CURRENT_USERNAME,
         "port": SEARCH_UI_PORT,
         "host": SEARCH_UI_HOST,
-        "project_root": str(Path(__file__).resolve().parent.parent),
-        "script_path": _UI_SERVER_SCRIPT_PATH,
+        "project_root": str(Path(__file__).resolve().parents[2]),
+        "script_path": _UI_SERVER_MODULE,
         "instance_id": _ui_instance_id,
         "started_epoch": now,
         "last_active_epoch": now,
@@ -359,7 +361,7 @@ def _is_owned_ui_process(lock: dict[str, object] | None) -> tuple[bool, str]:
     Conceptual ownership policy:
     - `lock.uid == os.getuid()` (user boundary)
     - `lock.pid` is alive
-    - command line contains `ui_server_standalone.py`
+    - command line contains module/server marker
     - command line contains the expected `instance_id`
     - optional hardening: process start time equals lock start time
 
@@ -392,7 +394,7 @@ def _is_owned_ui_process(lock: dict[str, object] | None) -> tuple[bool, str]:
     cmd = _get_process_command(pid)
     if not cmd:
         return False, "cannot inspect process command"
-    if _UI_SERVER_SCRIPT_NAME not in cmd:
+    if _UI_SERVER_MODULE not in cmd and _UI_SERVER_SCRIPT_NAME not in cmd:
         return False, "process command mismatch"
 
     instance_id = str(lock.get("instance_id", "")).strip()
@@ -546,7 +548,7 @@ def _load_sample_docs_with_note(
             source_index_name=source_index_name,
         )
     except TypeError as e:
-        # Some tests monkeypatch get_sample_docs_payload with the legacy 3-arg signature.
+        # Some tests monkeypatch get_sample_docs_payload with an older 3-arg signature.
         if "source_index_name" not in str(e):
             raise
         docs = get_sample_docs_payload(limit, sample_doc_json, source_local_file)
@@ -712,6 +714,8 @@ def _start_local_opensearch_container() -> None:
             "plugins.security.disabled=true",
             "-e",
             "DISABLE_INSTALL_DEMO_CONFIG=true",
+            "-e",
+            "OPENSEARCH_JAVA_OPTS=-Xms4g -Xmx4g",
             OPENSEARCH_DOCKER_IMAGE,
         ]
     )
@@ -1113,6 +1117,69 @@ def _collect_requested_vs_existing_field_type_mismatches(
             )
 
     return mismatches
+
+
+def _collect_doc_values_for_field(
+    sample_docs: list[dict[str, object]],
+    field_name: str,
+) -> list[object]:
+    normalized_field = _normalize_text(field_name).lower()
+    if not normalized_field:
+        return []
+
+    values: list[object] = []
+    for doc in sample_docs:
+        if not isinstance(doc, dict):
+            continue
+        for raw_key, raw_value in doc.items():
+            if _normalize_text(raw_key).lower() != normalized_field:
+                continue
+            if raw_value is None:
+                continue
+            values.append(raw_value)
+            break
+    return values
+
+
+def _classify_boolean_sample_value(value: object) -> str:
+    if isinstance(value, bool):
+        return "native_boolean"
+    if isinstance(value, str):
+        normalized = _normalize_text(value).lower()
+        if normalized in _BOOLEAN_STRING_FLAG_VALUES:
+            return "string_binary_flag"
+    return ""
+
+
+def _collect_boolean_typing_policy_violations(
+    field_types: dict[str, str],
+    sample_docs: list[dict[str, object]],
+) -> list[str]:
+    """Validate producer-driven boolean typing policy against sampled values."""
+    if not field_types or not sample_docs:
+        return []
+
+    violations: list[str] = []
+    for field_name, field_type in sorted(field_types.items()):
+        normalized_type = _normalize_text(field_type).lower()
+        if normalized_type != "boolean":
+            continue
+
+        observed_kinds: set[str] = set()
+        for value in _collect_doc_values_for_field(sample_docs, field_name):
+            kind = _classify_boolean_sample_value(value)
+            if kind:
+                observed_kinds.add(kind)
+
+        if "string_binary_flag" not in observed_kinds:
+            continue
+
+        observed = ", ".join(sorted(observed_kinds))
+        violations.append(
+            f"Field '{field_name}' violates producer-driven boolean typing policy "
+            f"(observed={observed}). Map this field as keyword when producer sends string flags (0/1/true/false)."
+        )
+    return violations
 
 
 def _resolve_field_spec_for_doc_key(
@@ -2598,6 +2665,25 @@ def apply_capability_driven_verification(
         return result
 
     field_specs = _extract_index_field_specs(opensearch_client, target_index)
+    field_types_for_policy = {
+        field_name: str(spec.get("type", "")).strip().lower()
+        for field_name, spec in field_specs.items()
+        if isinstance(spec, dict)
+    }
+    sample_docs_for_policy = _load_sample_docs(
+        limit=200,
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+    )
+    policy_violations = _collect_boolean_typing_policy_violations(
+        field_types=field_types_for_policy,
+        sample_docs=sample_docs_for_policy,
+    )
+    if policy_violations:
+        result["notes"] = ["Error: preflight failed. " + " ".join(policy_violations)]
+        return result
+
     evaluation = _evaluate_capability_driven_selection(
         worker_output=worker_output,
         count=effective_count,
@@ -3991,6 +4077,22 @@ def _kill_stale_ui_on_port() -> bool:
     return False
 
 
+def _stop_ui_process_on_port() -> bool:
+    """Stop the current listener on the configured UI port."""
+    listeners = _list_listener_pids_on_ui_port()
+    if not listeners:
+        return False
+
+    stopped_any = False
+    for pid in listeners:
+        stopped, _ = _terminate_process(pid)
+        if stopped:
+            stopped_any = True
+    if stopped_any:
+        _remove_ui_lock()
+    return stopped_any
+
+
 def _ensure_search_ui_server(preferred_index: str = "") -> dict[str, object]:
     with _search_ui.lock:
         if not SEARCH_UI_STATIC_DIR.exists():
@@ -4019,41 +4121,39 @@ def _ensure_search_ui_server(preferred_index: str = "") -> dict[str, object]:
                     "status": status,
                 }
 
-        if _is_ui_server_responsive():
+        if _is_ui_server_responsive() and not _stop_ui_process_on_port():
             listeners = _list_listener_pids_on_ui_port()
             pid_note = f"pid {listeners[0]}" if listeners else "an existing process"
             raise RuntimeError(
-                f"Search UI port {SEARCH_UI_PORT} is already serving requests via {pid_note}, "
-                "but ownership check failed. Not terminating that process. "
-                "Stop it manually or set SEARCH_UI_PORT to a free port and retry."
+                f"Search UI port {SEARCH_UI_PORT} is already serving requests via {pid_note}. "
+                "Failed to stop that process automatically."
             )
 
         _kill_stale_ui_on_port()
 
         listeners = _list_listener_pids_on_ui_port()
         if listeners:
-            conflict_pid = listeners[0]
-            conflict_cmd = _get_process_command(conflict_pid)
-            raise RuntimeError(
-                f"Search UI port {SEARCH_UI_PORT} is in use by pid {conflict_pid} "
-                f"({conflict_cmd or 'unknown command'}). Ownership check failed, "
-                "so the process was not terminated. Stop that process or set "
-                "SEARCH_UI_PORT to another free port."
-            )
+            _stop_ui_process_on_port()
+            listeners = _list_listener_pids_on_ui_port()
+            if listeners:
+                conflict_pid = listeners[0]
+                conflict_cmd = _get_process_command(conflict_pid)
+                raise RuntimeError(
+                    f"Search UI port {SEARCH_UI_PORT} is in use by pid {conflict_pid} "
+                    f"({conflict_cmd or 'unknown command'}). Failed to stop that process automatically."
+                )
 
-        server_script = str(Path(__file__).resolve().parent / "ui_server_standalone.py")
-        project_root = str(Path(__file__).resolve().parent.parent)
         instance_id = uuid.uuid4().hex
         subprocess.Popen(
             [
                 sys.executable,
-                server_script,
+                "-m",
+                _UI_SERVER_MODULE,
                 "--instance-id",
                 instance_id,
                 "--idle-timeout-seconds",
                 str(SEARCH_UI_IDLE_TIMEOUT_SECONDS),
             ],
-            cwd=project_root,
             start_new_session=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -4173,6 +4273,15 @@ def create_index(
         source_index_name=source_index_name,
     )
     requested_field_types = _extract_declared_field_types_from_index_body(body)
+    requested_boolean_policy_violations = _collect_boolean_typing_policy_violations(
+        field_types=requested_field_types,
+        sample_docs=sample_docs,
+    )
+    if requested_boolean_policy_violations:
+        return (
+            "Error: preflight failed. "
+            + " ".join(requested_boolean_policy_violations)
+        )
 
     def _index_exists(opensearch_client: OpenSearch, target_index: str) -> bool:
         try:
@@ -4212,10 +4321,21 @@ def create_index(
             existing_field_types=existing_field_types,
         )
         if mapping_mismatches:
+            existing_boolean_policy_violations = _collect_boolean_typing_policy_violations(
+                field_types=existing_field_types,
+                sample_docs=sample_docs,
+            )
+            policy_note = ""
+            if existing_boolean_policy_violations:
+                policy_note = (
+                    " This violates producer-driven boolean typing policy. "
+                    + " ".join(existing_boolean_policy_violations)
+                )
             return (
                 f"Error: Index '{index_name}' already exists with mappings incompatible with the requested schema. "
                 "Delete and recreate the index, or use replace_if_exists=true. "
                 + " ".join(mapping_mismatches)
+                + policy_note
             )
         return f"Index '{index_name}' already exists."
 
@@ -4262,10 +4382,21 @@ def create_index(
                 existing_field_types=existing_field_types,
             )
             if mapping_mismatches:
+                existing_boolean_policy_violations = _collect_boolean_typing_policy_violations(
+                    field_types=existing_field_types,
+                    sample_docs=sample_docs,
+                )
+                policy_note = ""
+                if existing_boolean_policy_violations:
+                    policy_note = (
+                        " This violates producer-driven boolean typing policy. "
+                        + " ".join(existing_boolean_policy_violations)
+                    )
                 return (
                     f"Error: Index '{index_name}' already exists with mappings incompatible with the requested schema. "
                     "Delete and recreate the index, or use replace_if_exists=true. "
                     + " ".join(mapping_mismatches)
+                    + policy_note
                 )
             return f"Index '{index_name}' already exists."
         return f"Failed to create index '{index_name}': {e}"
@@ -4972,12 +5103,19 @@ def cleanup_ui_server() -> str:
 
         listeners = _list_listener_pids_on_ui_port()
         if listeners:
+            _stop_ui_process_on_port()
+            listeners = _list_listener_pids_on_ui_port()
+            status = _search_ui_status_snapshot()
+            if not listeners:
+                return (
+                    "Search Builder UI server stopped successfully.\n"
+                    f"{_format_ui_status_line(status)}"
+                )
             conflict_pid = listeners[0]
             conflict_cmd = _get_process_command(conflict_pid)
-            status = _search_ui_status_snapshot()
             return (
-                f"Did not stop process on port {SEARCH_UI_PORT}. Ownership check failed"
-                f" ({owned_reason or 'lock missing'}).\n"
+                f"Failed to stop process on port {SEARCH_UI_PORT} "
+                f"(ownership detail: {owned_reason or 'lock missing'}).\n"
                 f"Port owner: pid {conflict_pid} ({conflict_cmd or 'unknown command'}).\n"
                 f"{_format_ui_status_line(status)}"
             )

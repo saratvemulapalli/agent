@@ -5,14 +5,23 @@ from dataclasses import dataclass, field
 
 from strands import Agent, tool
 from strands.models import BedrockModel
-from scripts.handler import ThinkingCallbackHandler
-from scripts.tools import (
+if __package__ in {None, ""}:
+    from pathlib import Path
+    import sys
+
+    _SCRIPT_EXECUTION_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+    if _SCRIPT_EXECUTION_PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _SCRIPT_EXECUTION_PROJECT_ROOT)
+
+from opensearch_orchestrator.scripts.handler import ThinkingCallbackHandler
+from opensearch_orchestrator.scripts.tools import (
+    BUILTIN_IMDB_SAMPLE_PATH,
     submit_sample_doc,
     submit_sample_doc_from_local_file,
     submit_sample_doc_from_localhost_index,
     submit_sample_doc_from_url,
 )
-from scripts.shared import (
+from opensearch_orchestrator.scripts.shared import (
     Phase,
     SUPPORTED_SAMPLE_FILE_FORMATS_COMMA,
     SUPPORTED_SAMPLE_FILE_FORMATS_MARKDOWN,
@@ -32,9 +41,9 @@ from scripts.shared import (
     clear_last_worker_run_state,
     get_last_worker_run_state,
 )
-from scripts.opensearch_ops_tools import cleanup_verification_docs
-from solution_planning_assistant import solution_planning_assistant, reset_planner_agent
-from worker import (
+from opensearch_orchestrator.scripts.opensearch_ops_tools import cleanup_verification_docs
+from opensearch_orchestrator.solution_planning_assistant import solution_planning_assistant, reset_planner_agent
+from opensearch_orchestrator.worker import (
     worker_agent as worker_agent_impl,
     _extract_sample_doc_json as worker_extract_sample_doc_json,
     _resolve_localhost_source_protection as worker_resolve_localhost_source_protection,
@@ -60,7 +69,7 @@ Your goal is to guide the user from initial requirements to a finalized, execute
         "System note" stating a sample document has already been loaded, trust it
         and proceed to Phase 2. Do NOT ask the user to paste content or re-upload.
     *   Supported sample sources:
-    *   `1` Built-in IMDb sample file: `scripts/sample_data/imdb.title.basics.tsv`
+    *   `1` Built-in IMDb sample file: `opensearch_orchestrator/scripts/sample_data/imdb.title.basics.tsv`
     *   `2` User-provided local path or URL
     *       Supported formats: __SUPPORTED_SAMPLE_FILE_FORMATS_MARKDOWN__
     *       Example: `/path/to/your/data.json` or `https://example.com/sample.json`
@@ -171,7 +180,6 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 # -------------------------------------------------------------------------
 
 MODEL_ID = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
-BUILTIN_IMDB_SAMPLE_PATH = "scripts/sample_data/imdb.title.basics.tsv"
 
 _RESUME_WORKER_MARKER = "[RESUME_WORKER_FROM_FAILED_STEP]"
 _SYSTEM_SOURCE_CONTEXT_HEADER = "[SYSTEM SOURCE CONTEXT]"
@@ -285,6 +293,8 @@ _HYBRID_WEIGHT_OPTION_LEXICAL = "lexical-heavy"
 _QUERY_PATTERN_OPTION_MOSTLY_EXACT = "mostly-exact"
 _QUERY_PATTERN_OPTION_BALANCED = "balanced"
 _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC = "mostly-semantic"
+_PREFIX_WILDCARD_OPTION_ENABLED = "enabled"
+_PREFIX_WILDCARD_OPTION_DISABLED = "disabled"
 _DEFAULT_QUERY_FEATURES_NOTE_PREFIX = "Requirements note: default query features are required:"
 _PREFIX_WILDCARD_REQUIREMENT_NOTE_PREFIX = "Requirements note: prefix/wildcard matching preference ="
 _TEXT_SEARCH_USE_CASE_NOTE_PREFIX = "Requirements note: inferred search use case ="
@@ -548,6 +558,39 @@ def _read_model_deployment_preference_choice(
     }:
         return _MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE
     return normalized
+
+
+
+def _read_prefix_wildcard_preference_choice(
+    candidate_fields: list[str] | None = None,
+) -> bool:
+    """Read whether prefix/wildcard capability should be enabled."""
+    preview = _extract_text_field_preview(candidate_fields)
+    prompt = (
+        "Do you need prefix/wildcard matching support? "
+        "Enabling this implies lexical BM25 support."
+    )
+    if preview:
+        prompt = (
+            f"From your sample data, fields like {preview} look text-heavy. "
+            "Do you need prefix/wildcard matching support? Enabling this implies lexical BM25 support."
+        )
+    selected = read_single_choice_input(
+        title="Prefix/Wildcard Matching",
+        prompt=prompt,
+        options=[
+            (
+                _PREFIX_WILDCARD_OPTION_ENABLED,
+                "Yes - include prefix/wildcard matching (implies lexical BM25)",
+            ),
+            (
+                _PREFIX_WILDCARD_OPTION_DISABLED,
+                "No - semantic/structured search only for this capability",
+            ),
+        ],
+        default_value=_PREFIX_WILDCARD_OPTION_DISABLED,
+    )
+    return str(selected or _PREFIX_WILDCARD_OPTION_DISABLED).strip().lower() == _PREFIX_WILDCARD_OPTION_ENABLED
 
 
 

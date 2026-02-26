@@ -1,4 +1,4 @@
-from scripts.handler import ThinkingCallbackHandler
+from opensearch_orchestrator.scripts.handler import ThinkingCallbackHandler
 
 
 def test_callback_logs_do_not_write_stdout(capsys):

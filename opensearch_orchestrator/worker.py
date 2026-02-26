@@ -5,8 +5,16 @@ from pathlib import Path
 
 from strands import Agent, tool
 from strands.models import BedrockModel
-from scripts.handler import ThinkingCallbackHandler
-from scripts.opensearch_ops_tools import (
+if __package__ in {None, ""}:
+    from pathlib import Path
+    import sys
+
+    _SCRIPT_EXECUTION_PROJECT_ROOT = str(Path(__file__).resolve().parents[1])
+    if _SCRIPT_EXECUTION_PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _SCRIPT_EXECUTION_PROJECT_ROOT)
+
+from opensearch_orchestrator.scripts.handler import ThinkingCallbackHandler
+from opensearch_orchestrator.scripts.opensearch_ops_tools import (
     SEARCH_UI_HOST,
     SEARCH_UI_PORT,
     apply_capability_driven_verification as apply_capability_driven_verification_impl,
@@ -18,8 +26,8 @@ from scripts.opensearch_ops_tools import (
     launch_search_ui,
     set_search_ui_suggestions,
 )
-from scripts.tools import search_opensearch_org
-from scripts.shared import (
+from opensearch_orchestrator.scripts.tools import BUILTIN_IMDB_SAMPLE_PATH, search_opensearch_org
+from opensearch_orchestrator.scripts.shared import (
     SUPPORTED_SAMPLE_FILE_EXTENSION_REGEX,
     mark_execution_completed,
     set_last_worker_context,
@@ -367,8 +375,8 @@ def _resolve_source_local_file(context: str) -> str:
     if candidate:
         return candidate
 
-    if "scripts/sample_data/imdb.title.basics.tsv" in text:
-        return "scripts/sample_data/imdb.title.basics.tsv"
+    if BUILTIN_IMDB_SAMPLE_PATH in text:
+        return BUILTIN_IMDB_SAMPLE_PATH
 
     return ""
 
@@ -757,7 +765,7 @@ def worker_agent(context: str) -> str:
             candidate_path = Path(inferred_source_local_file).expanduser()
             if candidate_path.exists() and candidate_path.is_file():
                 default_source_local_file = str(candidate_path)
-            elif inferred_source_local_file == "scripts/sample_data/imdb.title.basics.tsv":
+            elif inferred_source_local_file == BUILTIN_IMDB_SAMPLE_PATH:
                 # Keep workspace-relative built-in sample path for portable runs.
                 default_source_local_file = inferred_source_local_file
             else:
