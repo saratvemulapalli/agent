@@ -150,40 +150,222 @@ Use the opensearch-mcp-server tools to create the index on the collection endpoi
 2. Create the index on the serverless collection endpoint
 3. Include all mappings, settings, and configurations from local setup
 
-### Step 6: Deploy ML Models (if applicable)
+### Step 6: Deploy ML Models and Pipelines for Dense Vector Search
 
 **For Neural Sparse**: Skip this step - automatic semantic enrichment handles everything.
 
-**For Dense Vector embeddings** (semantic/hybrid search):
+**For Dense Vector embeddings** (semantic/hybrid search with dense vectors):
 
-OpenSearch Serverless supports:
-1. **Amazon Bedrock integration** (recommended):
-   - No model deployment needed
-   - Use Bedrock connector in pipelines
-   - Supports models like Titan Embeddings, Cohere Embed
-   
-2. **Remote models via connectors**:
-   - SageMaker endpoints
-   - External API endpoints
+Dense vector search requires setting up ML Commons connector, model, ingest pipeline, and search pipeline. This guide uses Amazon Bedrock Titan Text Embeddings V2 as the default.
 
-Update pipeline configurations to use AWS-hosted models instead of local models.
+#### Step 6.1: Create IAM Role for Bedrock Access
 
-### Step 7: Create Ingest Pipelines (if needed)
+Create an IAM role that allows OpenSearch Serverless to invoke Bedrock models:
 
-**For Neural Sparse with automatic semantic enrichment**: Skip this step - pipelines are automatically created and managed.
+```json
+POST /iam/CreateRole
+{
+  "RoleName": "opensearch-bedrock-role",
+  "AssumeRolePolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ml.opensearchservice.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }]
+  }
+}
+```
 
-**For other search strategies**:
+Attach permissions policy:
 
-Recreate ingest pipelines on the serverless collection:
+```json
+POST /iam/PutRolePolicy
+{
+  "RoleName": "opensearch-bedrock-role",
+  "PolicyName": "BedrockInvokePolicy",
+  "PolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": "bedrock:InvokeModel",
+      "Resource": "arn:aws:bedrock:*::foundation-model/amazon.titan-embed-text-v2:0"
+    }]
+  }
+}
+```
 
-1. Get pipeline definitions from local setup
-2. Create pipelines using opensearch-mcp-server
-3. Update processor configurations for AWS (e.g., Bedrock connectors)
-4. Attach pipelines to the index
+Note the role ARN for use in the connector.
 
-### Step 8: Index Sample Documents
+#### Step 6.2: Create ML Commons Connector
 
-### Step 8: Index Sample Documents
+Use the opensearch-mcp-server to create a connector to Bedrock Titan:
+
+```
+POST <collection-endpoint>/_plugins/_ml/connectors/_create
+{
+  "name": "Amazon Bedrock Titan Embedding V2",
+  "description": "Connector to Bedrock Titan embedding model",
+  "version": 1,
+  "protocol": "aws_sigv4",
+  "parameters": {
+    "region": "<aws-region>",
+    "service_name": "bedrock"
+  },
+  "credential": {
+    "roleArn": "<opensearch-bedrock-role-arn>"
+  },
+  "actions": [{
+    "action_type": "predict",
+    "method": "POST",
+    "url": "https://bedrock-runtime.<aws-region>.amazonaws.com/model/amazon.titan-embed-text-v2:0/invoke",
+    "headers": {
+      "content-type": "application/json",
+      "x-amz-content-sha256": "required"
+    },
+    "request_body": "{ \"inputText\": \"${parameters.inputText}\" }",
+    "pre_process_function": "\n    StringBuilder builder = new StringBuilder();\n    builder.append(\"\\\"\");\n    String first = params.text_docs[0];\n    builder.append(first);\n    builder.append(\"\\\"\");\n    def parameters = \"{\" +\"\\\"inputText\\\":\" + builder + \"}\";\n    return  \"{\" +\"\\\"parameters\\\":\" + parameters + \"}\";",
+    "post_process_function": "\n      def name = \"sentence_embedding\";\n      def dataType = \"FLOAT32\";\n      if (params.embedding == null || params.embedding.length == 0) {\n        return params.message;\n      }\n      def shape = [params.embedding.length];\n      def json = \"{\" +\n                 \"\\\"name\\\":\\\"\" + name + \"\\\",\" +\n                 \"\\\"data_type\\\":\\\"\" + dataType + \"\\\",\" +\n                 \"\\\"shape\\\":\" + shape + \",\" +\n                 \"\\\"data\\\":\" + params.embedding +\n                 \"}\";\n      return json;\n    "
+  }]
+}
+```
+
+Note the `connector_id` from the response.
+
+#### Step 6.3: Register and Deploy the Model
+
+Create a model group:
+
+```
+POST <collection-endpoint>/_plugins/_ml/model_groups/_register
+{
+  "name": "bedrock_embedding_models",
+  "description": "Model group for Bedrock embedding models"
+}
+```
+
+Register the model:
+
+```
+POST <collection-endpoint>/_plugins/_ml/models/_register
+{
+  "name": "bedrock-titan-embed-v2",
+  "function_name": "remote",
+  "description": "Bedrock Titan Text Embeddings V2",
+  "model_group_id": "<model-group-id>",
+  "connector_id": "<connector-id>"
+}
+```
+
+Deploy the model:
+
+```
+POST <collection-endpoint>/_plugins/_ml/models/<model-id>/_deploy
+```
+
+Test the model:
+
+```
+POST <collection-endpoint>/_plugins/_ml/models/<model-id>/_predict
+{
+  "parameters": {
+    "inputText": "hello world"
+  }
+}
+```
+
+Verify the response contains 1024-dimensional embeddings (Titan V2 default).
+
+#### Step 6.4: Create Ingest Pipeline
+
+Create an ingest pipeline that uses the model to generate embeddings:
+
+```
+PUT <collection-endpoint>/_ingest/pipeline/bedrock-embedding-pipeline
+{
+  "description": "Bedrock Titan embedding pipeline",
+  "processors": [{
+    "text_embedding": {
+      "model_id": "<model-id>",
+      "field_map": {
+        "<text-field>": "<vector-field>"
+      }
+    }
+  }]
+}
+```
+
+Replace `<text-field>` with the source text field name and `<vector-field>` with the target vector field name from your local configuration.
+
+#### Step 6.5: Create Index with Vector Mappings
+
+Create the index with knn_vector mappings:
+
+```
+PUT <collection-endpoint>/<index-name>
+{
+  "settings": {
+    "index": {
+      "knn": true,
+      "knn.space_type": "cosinesimil",
+      "default_pipeline": "bedrock-embedding-pipeline"
+    }
+  },
+  "mappings": {
+    "properties": {
+      "<text-field>": {
+        "type": "text"
+      },
+      "<vector-field>": {
+        "type": "knn_vector",
+        "dimension": 1024,
+        "method": {
+          "name": "hnsw",
+          "space_type": "cosinesimil",
+          "engine": "faiss"
+        }
+      }
+    }
+  }
+}
+```
+
+Key configuration:
+- `dimension`: 1024 for Titan V2 (default), 512 or 256 if configured
+- `space_type`: "cosinesimil" for cosine similarity (recommended for text)
+- `method`: HNSW algorithm with FAISS engine for efficient search
+
+#### Step 6.6: Create Search Pipeline (for hybrid search)
+
+If using hybrid search (BM25 + vector), create a search pipeline with normalization:
+
+```
+PUT <collection-endpoint>/_search/pipeline/hybrid-search-pipeline
+{
+  "description": "Hybrid search with normalization",
+  "phase_results_processors": [{
+    "normalization-processor": {
+      "normalization": {
+        "technique": "min_max"
+      },
+      "combination": {
+        "technique": "arithmetic_mean",
+        "parameters": {
+          "weights": [0.3, 0.7]
+        }
+      }
+    }
+  }]
+}
+```
+
+Adjust weights based on your preference (first weight for BM25, second for vector).
+
+**For pure vector search**: Skip this step - no search pipeline needed.
+
+### Step 7: Index Sample Documents
 
 Index test documents to verify the setup:
 
@@ -192,9 +374,15 @@ Index test documents to verify the setup:
    - Documents are automatically enriched during ingestion
    - Sparse vectors are generated and stored
    - No additional configuration needed
-3. For other strategies: Verify embeddings are generated correctly
-4. Test search queries to confirm functionality
-5. For Neural Sparse: Use standard "match" queries - they're automatically rewritten to neural sparse queries
+3. For Dense Vector search:
+   - Documents are processed through the ingest pipeline
+   - Bedrock Titan generates embeddings automatically
+   - Embeddings are stored in the vector field
+4. Test search queries to confirm functionality:
+   - Neural Sparse: Use standard "match" queries (automatically rewritten)
+   - Dense Vector: Use "neural" query with the model_id
+
+### Step 8: Provide Access Information
 
 Give the user:
 - Collection endpoint URL

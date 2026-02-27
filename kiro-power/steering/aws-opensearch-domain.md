@@ -174,14 +174,238 @@ For advanced agentic search features:
 3. Set up custom scoring and ranking
 4. Enable search relevance tuning
 
-### Step 11: Index Sample Documents
+### Step 11: Configure Agentic Search (Required for Agentic Search Strategy)
+
+**For non-agentic search strategies**: Skip this step.
+
+**For Agentic Search**: Configure conversational agents with QueryPlanningTool to enable natural language search.
+
+Agentic search allows users to ask questions in natural language and have OpenSearch automatically plan and execute the retrieval. This requires OpenSearch 3.2+ and uses Bedrock Claude as the reasoning model.
+
+#### Step 11.1: Create IAM Role for Bedrock Access
+
+Create an IAM role for OpenSearch to invoke Bedrock Claude models:
+
+```json
+POST /iam/CreateRole
+{
+  "RoleName": "opensearch-bedrock-agent-role",
+  "AssumeRolePolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "opensearchservice.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }]
+  }
+}
+```
+
+Attach permissions policy:
+
+```json
+POST /iam/PutRolePolicy
+{
+  "RoleName": "opensearch-bedrock-agent-role",
+  "PolicyName": "BedrockClaudeInvokePolicy",
+  "PolicyDocument": {
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": "bedrock:InvokeModel",
+      "Resource": "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet-*"
+    }]
+  }
+}
+```
+
+#### Step 11.2: Map ML Role (if using fine-grained access control)
+
+If your domain uses fine-grained access control:
+
+1. Log in to OpenSearch Dashboards
+2. Navigate to Security > Roles
+3. Select the `ml_full_access` role
+4. Choose Mapped users > Manage mapping
+5. Add the IAM role ARN under Backend roles:
+   ```
+   arn:aws:iam::<account-id>:role/opensearch-bedrock-agent-role
+   ```
+6. Click Map
+
+#### Step 11.3: Create Bedrock Claude Connector
+
+Create a connector to Bedrock Claude 3.5 Sonnet using the Converse API:
+
+```
+POST <domain-endpoint>/_plugins/_ml/connectors/_create
+{
+  "name": "Amazon Bedrock Claude 3.5 Sonnet",
+  "description": "Connector for Bedrock Claude 3.5 Sonnet for agentic search",
+  "version": 1,
+  "protocol": "aws_sigv4",
+  "credential": {
+    "roleArn": "<opensearch-bedrock-agent-role-arn>"
+  },
+  "parameters": {
+    "region": "<aws-region>",
+    "service_name": "bedrock",
+    "model": "anthropic.claude-3-5-sonnet-20240620-v1:0",
+    "system_prompt": "You are a helpful assistant that plans and executes search queries.",
+    "temperature": 0.0,
+    "top_p": 0.9,
+    "max_tokens": 2000
+  },
+  "actions": [{
+    "action_type": "predict",
+    "method": "POST",
+    "headers": {
+      "content-type": "application/json"
+    },
+    "url": "https://bedrock-runtime.${parameters.region}.amazonaws.com/model/${parameters.model}/converse",
+    "request_body": "{ \"system\": [{\"text\": \"${parameters.system_prompt}\"}], \"messages\": ${parameters.messages}, \"inferenceConfig\": {\"temperature\": ${parameters.temperature}, \"topP\": ${parameters.top_p}, \"maxTokens\": ${parameters.max_tokens}} }"
+  }]
+}
+```
+
+Note the `connector_id` from the response.
+
+#### Step 11.4: Register and Deploy the Model
+
+Register the model:
+
+```
+POST <domain-endpoint>/_plugins/_ml/models/_register?deploy=true
+{
+  "name": "Bedrock Claude 3.5 Sonnet for Agentic Search",
+  "function_name": "remote",
+  "description": "Claude 3.5 Sonnet model for query planning and reasoning",
+  "connector_id": "<connector-id>"
+}
+```
+
+Note the `model_id` from the response.
+
+Test the model:
+
+```
+POST <domain-endpoint>/_plugins/_ml/models/<model-id>/_predict
+{
+  "parameters": {
+    "messages": [{
+      "role": "user",
+      "content": [{
+        "text": "hello"
+      }]
+    }]
+  }
+}
+```
+
+Verify the response contains Claude's generated text.
+
+#### Step 11.5: Create Conversational Agent with QueryPlanningTool
+
+Create a conversational agent that uses the QueryPlanningTool:
+
+```
+POST <domain-endpoint>/_plugins/_ml/agents/_register
+{
+  "name": "Agentic Search Agent",
+  "type": "conversational",
+  "description": "Agent for natural language search with automatic query planning",
+  "llm": {
+    "model_id": "<model-id>",
+    "parameters": {
+      "max_iteration": 15
+    }
+  },
+  "memory": {
+    "type": "conversation_index"
+  },
+  "parameters": {
+    "_llm_interface": "bedrock/converse"
+  },
+  "tools": [{
+    "type": "QueryPlanningTool"
+  }],
+  "app_type": "os_chat"
+}
+```
+
+Key configuration:
+- `type`: "conversational" for full agent capabilities (use "flow" for simpler, faster queries)
+- `max_iteration`: Maximum reasoning steps (15 recommended)
+- `embedding_model_id`: Required if using neural/semantic search
+- `QueryPlanningTool`: Enables automatic query DSL generation from natural language
+
+Note the `agent_id` from the response.
+
+#### Step 11.6: Create Agentic Search Pipeline
+
+Create a search pipeline with the agentic query translator:
+
+```
+PUT <domain-endpoint>/_search/pipeline/agentic-search-pipeline
+{
+  "request_processors": [{
+    "agentic_query_translator": {
+      "agent_id": "<agent-id>"
+    }
+  }]
+}
+```
+
+#### Step 11.7: Test Agentic Search
+
+Test the agentic search with a natural language query:
+
+```
+GET <domain-endpoint>/<index-name>/_search?search_pipeline=agentic-search-pipeline
+{
+  "query": {
+    "agentic": {
+      "query_text": "Find all documents about machine learning published in the last year",
+      "query_fields": ["title", "content", "publish_date"]
+    }
+  }
+}
+```
+
+The agent will:
+1. Analyze the natural language question
+2. Examine the index mapping
+3. Generate appropriate OpenSearch DSL query
+4. Execute the query and return results
+
+#### Step 11.8: Enable Conversation Memory (Optional)
+
+To enable multi-turn conversations:
+
+Create a memory:
+
+```
+POST <domain-endpoint>/_plugins/_ml/memory/
+{
+  "name": "User conversation about search results"
+}
+```
+
+Note the `memory_id` and include it in subsequent searches to maintain context across queries.
+
+### Step 12: Index Sample Documents
 
 Index test documents to verify the setup:
 
 1. Use the same sample documents from Phase 1
-2. Verify embeddings and processing
-3. Test agentic search queries
-4. Validate performance and relevance
+2. For Agentic Search:
+   - Test with natural language queries
+   - Verify the agent generates appropriate DSL
+   - Check that results match the intent
+3. For other strategies: Verify embeddings and search functionality
+4. Monitor query performance and agent reasoning traces
 
 ### Step 12: Configure Monitoring and Alerting
 
