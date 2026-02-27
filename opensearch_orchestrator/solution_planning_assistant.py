@@ -13,7 +13,7 @@ if __package__ in {None, ""}:
         sys.path.insert(0, _SCRIPT_EXECUTION_PROJECT_ROOT)
 
 from opensearch_orchestrator.scripts.handler import ThinkingCallbackHandler
-from opensearch_orchestrator.scripts.opensearch_ops_tools import preview_capability_driven_verification
+from opensearch_orchestrator.scripts.opensearch_ops_tools import preview_cap_driven_verification
 from opensearch_orchestrator.scripts.tools import (
     BUILTIN_IMDB_SAMPLE_PATH,
     read_knowledge_base,
@@ -706,7 +706,7 @@ def solution_planning_assistant(context: str) -> dict:
                     source_local_file = _extract_source_local_file(context)
                     source_index_name = _extract_localhost_source_index_name(context)
                     try:
-                        preview_result = preview_capability_driven_verification(
+                        preview_result = preview_cap_driven_verification(
                             worker_output=capability_block_for_precheck,
                             count=10,
                             sample_doc_json=sample_doc_json,

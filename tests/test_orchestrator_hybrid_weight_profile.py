@@ -74,10 +74,10 @@ def test_read_hybrid_weight_profile_choice_uses_field_context_and_three_options(
     assert prompt.startswith(
         "From your sample data, fields like title, description look text-heavy."
     )
-    assert (
-        "For your semantic search use cases, which best describes the typical user query style?"
-        in prompt
-    )
+    assert "Query pattern: How do you expect users to search?" in prompt
+    assert options[0][1] == 'Mostly exact keywords (like "Carmencita 1894")'
+    assert options[1][1] == 'Semantic/natural language (like "early silent films about dancers")'
+    assert options[2][1] == "Balanced mix of both (default)"
 
 
 def test_is_semantic_dominant_query_pattern_true_for_semantic():
@@ -92,4 +92,19 @@ def test_is_semantic_dominant_query_pattern_false_for_lexical_and_balanced():
     )
     assert not orchestrator._is_semantic_dominant_query_pattern(
         orchestrator._HYBRID_WEIGHT_OPTION_BALANCED
+    )
+
+
+def test_requires_model_deployment_preference_true_for_balanced_and_semantic():
+    assert orchestrator._requires_model_deployment_preference(
+        orchestrator._HYBRID_WEIGHT_OPTION_BALANCED
+    )
+    assert orchestrator._requires_model_deployment_preference(
+        orchestrator._HYBRID_WEIGHT_OPTION_SEMANTIC
+    )
+
+
+def test_requires_model_deployment_preference_false_for_lexical():
+    assert not orchestrator._requires_model_deployment_preference(
+        orchestrator._HYBRID_WEIGHT_OPTION_LEXICAL
     )

@@ -7,16 +7,19 @@
         "opensearch_orchestrator/mcp_server.py"
       ],
       "cwd": "/Users/kaituo/code/poc/agent-poc",
-      "env": {
-        "AWS_PROFILE": "bedrock"
-      },
       "disabled": false,
       "autoApprove": [
         "load_sample",
         "set_preferences",
         "start_planning",
+        "refine_plan",
         "finalize_plan",
-        "execute_plan"
+        "execute_plan",
+        "retry_execution",
+        "read_knowledge_base",
+        "read_dense_vector_models",
+        "read_sparse_vector_models",
+        "set_plan_from_planning_complete"
       ]
     }
   }

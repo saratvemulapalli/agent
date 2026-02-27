@@ -5,7 +5,7 @@
       "args": ["run", "opensearch_orchestrator/mcp_server.py"],
       "cwd": "/Users/kaituo/code/poc/agent-poc",
       "env": {
-        "AWS_PROFILE": "bedrock"
+        "OPENSEARCH_MCP_PLANNER_MODE": "client"
       }
     }
   }

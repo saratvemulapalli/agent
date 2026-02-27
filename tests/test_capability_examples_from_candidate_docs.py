@@ -392,7 +392,7 @@ def test_preview_verification_infers_text_like_fields_without_index_mapping(monk
         "- Autocomplete: prefix lookup\n"
         "- Fuzzy: typo tolerance\n"
     )
-    preview = tools.preview_capability_driven_verification(worker_output=worker_output, count=1)
+    preview = tools.preview_cap_driven_verification(worker_output=worker_output, count=1)
 
     applicable = set(preview.get("applicable_capabilities", []))
     assert {"exact", "autocomplete", "fuzzy"}.issubset(applicable)
@@ -427,7 +427,7 @@ def test_preview_and_apply_keep_capability_applicability_consistent(monkeypatch)
         "- Structured: numeric/date filters\n"
         "- Autocomplete: typeahead prefixes\n"
     )
-    preview = tools.preview_capability_driven_verification(
+    preview = tools.preview_cap_driven_verification(
         worker_output=worker_output,
         count=1,
     )

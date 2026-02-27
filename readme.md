@@ -63,11 +63,21 @@ The server exposes high-level phase tools that mirror the standalone orchestrato
 | `start_planning` | 3 | Start the planning agent; returns initial architecture proposal |
 | `refine_plan` | 3 | Send user feedback to refine the proposal |
 | `finalize_plan` | 3 | Finalize the plan when the user confirms |
+| `set_plan` | 3 | Store a client-authored finalized plan (validated manual fallback) |
+| `set_plan_from_planning_complete` | 3 | Parse/store a `<planning_complete>` planner response |
 | `execute_plan` | 4 | Execute the plan (create index, models, pipelines, UI) |
 | `retry_execution` | 4 | Resume from a failed execution step |
 | `cleanup_verification` | Post | Remove test documents on user request |
 
 Low-level domain tools (`create_index`, `submit_sample_doc`, etc.) are also exposed for advanced use.
+
+Planner backend in MCP mode:
+- Default: `OPENSEARCH_MCP_PLANNER_MODE=client` (uses MCP client sampling / client LLM).
+- Server mode: `OPENSEARCH_MCP_PLANNER_MODE=server` (uses server-side Bedrock planner).
+- Client fallback: if the MCP client does not support `sampling/createMessage`,
+  `start_planning` returns `manual_planning_required=true` plus
+  `manual_planner_system_prompt` and `manual_planner_initial_input`; run planner turns
+  with the client LLM and call `set_plan_from_planning_complete(planner_response)`.
 
 ### Cursor integration
 
@@ -131,13 +141,27 @@ pip install mcp opensearch-py
 Build and validate before publishing:
 
 ```bash
-uv run pytest -q
-uv build
-python -m zipfile -l dist/*.whl
-python -c "import opensearch_orchestrator.mcp_server as m; print(hasattr(m, 'main'))"
-uvx --from dist/*.whl opensearch-orchestrator
+# 1) bump version manually (not automatic)
+#    update both files to the same value, e.g. 0.10.1
+#    - pyproject.toml: [project].version
+#    - opensearch_orchestrator/__init__.py: __version__
+#
+# optional sanity check:
+python -c "import tomllib; p=tomllib.load(open('pyproject.toml','rb')); import opensearch_orchestrator as pkg; print('pyproject=', p['project']['version'], 'package=', pkg.__version__)"
 
-# Upload to PyPI (needs a PyPI account + API token)
+# 2) all tests have to pass
+uv run pytest -q
+
+# 3) build and verify artifacts
+uv build
+for whl in dist/*.whl; do python -m zipfile -l "$whl"; done
+python -c "import opensearch_orchestrator.mcp_server as m; print(hasattr(m, 'main'))"
+# pick wheel for the current package version (avoids selecting older builds)
+VERSION="$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+WHEEL_PATH="$(ls dist/opensearch_orchestrator-${VERSION}-*.whl)"
+uvx --from "$WHEEL_PATH" opensearch-orchestrator
+
+# 4) upload to PyPI (needs a PyPI account + API token)
 uv publish --token pypi-YOUR-TOKEN
 ```
 

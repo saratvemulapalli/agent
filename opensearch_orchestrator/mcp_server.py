@@ -1,5 +1,5 @@
 # /// script
-# dependencies = ["mcp", "opensearch-py", "strands-agents"]
+# dependencies = ["anyio", "mcp", "opensearch-py", "pandas>=2.3.3", "pyarrow>=23.0.1", "strands-agents"]
 # ///
 
 """MCP server exposing the OpenSearch orchestrator workflow as phase tools.
@@ -21,58 +21,19 @@ if __package__ in {None, ""}:
         sys.path.insert(0, _SCRIPT_EXECUTION_PROJECT_ROOT)
 
 import errno
-import json
+import os
+import re
 import sys
 
 import anyio
-from mcp.server.fastmcp import FastMCP
+from mcp import types as mcp_types
+from mcp.server.fastmcp import Context, FastMCP
 
-from opensearch_orchestrator.orchestrator import (
-    SessionState,
-    _infer_semantic_text_fields,
-    _capture_sample_from_result,
-    _build_budget_preference_note,
-    _build_performance_preference_note,
-    _build_semantic_query_pattern_preference_note,
-    _build_model_deployment_preference_note,
-    _build_prefix_wildcard_requirement_note,
-    _build_text_search_use_case_note,
-    _build_hybrid_weight_profile_note,
-    _augment_worker_context_with_source,
-    _run_worker_agent_with_state,
-    _is_semantic_dominant_query_pattern,
-    _reset_session_state,
-    _clear_orchestrator_sample_state,
-    _BUDGET_OPTION_FLEXIBLE,
-    _BUDGET_OPTION_COST_SENSITIVE,
-    _PERFORMANCE_OPTION_SPEED,
-    _PERFORMANCE_OPTION_BALANCED,
-    _PERFORMANCE_OPTION_ACCURACY,
-    _QUERY_PATTERN_OPTION_MOSTLY_EXACT,
-    _QUERY_PATTERN_OPTION_BALANCED,
-    _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC,
-    _MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE,
-    _MODEL_DEPLOYMENT_OPTION_SAGEMAKER_ENDPOINT,
-    _MODEL_DEPLOYMENT_OPTION_EXTERNAL_EMBEDDING_API,
-    _HYBRID_WEIGHT_OPTION_SEMANTIC,
-    _HYBRID_WEIGHT_OPTION_BALANCED,
-    _HYBRID_WEIGHT_OPTION_LEXICAL,
-    _DEFAULT_QUERY_FEATURES_NOTE,
-    _MODEL_DEPLOYMENT_SCOPE_NOTE,
-    _PERFORMANCE_PRIORITY_SCOPE_NOTE,
-    _SAMPLE_FINAL_TRUTH_NOTE,
-    _SEMANTIC_EXPANSION_EXPLANATION_NOTE,
-    _NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE,
-    _MAPPING_CLARITY_FEEDBACK_NOTE,
-    _DEFAULT_SPECIFIC_USE_CASES_NOTE,
-    _DEFAULT_QUERY_SUPPORT_SCOPE_NOTE,
-    _DEFAULT_DASHBOARD_REQUIREMENT_NOTE,
-    _DEFAULT_REALTIME_REQUIREMENT_NOTE,
-    _DEFAULT_CUSTOM_REQUIREMENTS_NOTE,
-    _RESUME_WORKER_MARKER,
-)
+from opensearch_orchestrator.orchestrator import create_transport_agnostic_engine
 from opensearch_orchestrator.planning_session import PlanningSession
-from opensearch_orchestrator.scripts.shared import Phase, get_last_worker_run_state
+from opensearch_orchestrator.solution_planning_assistant import (
+    SYSTEM_PROMPT as PLANNER_SYSTEM_PROMPT,
+)
 from opensearch_orchestrator.scripts.tools import (
     BUILTIN_IMDB_SAMPLE_PATH,
     submit_sample_doc,
@@ -97,12 +58,11 @@ from opensearch_orchestrator.scripts.opensearch_ops_tools import (
     delete_doc,
     cleanup_verification_docs,
     apply_capability_driven_verification,
-    preview_capability_driven_verification,
+    preview_cap_driven_verification,
     launch_search_ui,
     cleanup_ui_server,
     set_search_ui_suggestions,
 )
-from opensearch_orchestrator.worker import worker_agent as worker_agent_impl
 
 # -------------------------------------------------------------------------
 # Workflow prompt (shared by MCP prompt and Cursor rule)
@@ -122,17 +82,23 @@ Use the opensearch-orchestrator MCP tools to guide the user from requirements to
 - A sample document is required before any planning or execution.
 
 ### Phase 2: Gather Preferences
-- Ask the user about:
+- Ask one preference question at a time, in this order:
   - **Budget**: flexible or cost-sensitive
   - **Performance priority**: speed-first, balanced, or accuracy-first
-  - **Query pattern**: mostly-exact, balanced, or mostly-semantic
-  - **Deployment preference** (only if query pattern is mostly-semantic): opensearch-node, sagemaker-endpoint, or external-embedding-api
-- Use fixed-option format for each question, not free-text.
+  - **Query pattern**: mostly-exact (like "Carmencita 1894"), mostly-semantic
+    (like "early silent films about dancers"), or balanced (mix of both)
+- Use the client user-input UI for each question (fixed options only, not free-text).
+- If query pattern is balanced or mostly-semantic, ask **Deployment preference** as a separate follow-up question:
+  opensearch-node, sagemaker-endpoint, or external-embedding-api (also via user-input UI).
 - Call `set_preferences(budget, performance, query_pattern, deployment_preference)` with the collected values.
 
 ### Phase 3: Plan
 - Call `start_planning()` to get an initial architecture proposal from the planner agent.
-- Present the proposal to the user verbatim (do not summarize it away).
+- If `start_planning()` returns `manual_planning_required=true`, use the client LLM to draft
+  planner turns using the returned `manual_planner_system_prompt` and
+  `manual_planner_initial_input`, then call `set_plan_from_planning_complete(...)`
+  once the user confirms.
+- Otherwise, present the proposal to the user verbatim (do not summarize it away).
 - If the user has feedback or questions, call `refine_plan(user_feedback)`. Repeat as needed.
 - When the user confirms, call `finalize_plan()`.
   This returns {solution, search_capabilities, keynote}.
@@ -148,32 +114,20 @@ Use the opensearch-orchestrator MCP tools to guide the user from requirements to
 
 ## Rules
 - Never skip Phase 1. A sample document is mandatory before planning.
-- Do not generate the solution plan yourself; always delegate to the planner tools.
+- Prefer planner tools for plan generation.
+- If manual planning is required (client sampling unavailable), generate the plan with the
+  client LLM using the provided planner prompt/input and persist it with
+  `set_plan_from_planning_complete(...)` before execution.
 - Show the planner's proposal text to the user verbatim; do not summarize it away.
-- For preference questions, use fixed-option format, not free-text.
+- For preference questions, ask one question per turn and use user-input UI fixed options, not free-text.
 - Do not ask redundant clarification questions for items already inferred from the sample data.
 """
 
 # -------------------------------------------------------------------------
-# Session state (single session per stdio connection)
+# Shared workflow engine (single session per stdio connection)
 # -------------------------------------------------------------------------
 
-
-class OrchestratorSession:
-    def __init__(self) -> None:
-        self.state = SessionState()
-        self.phase = Phase.COLLECT_SAMPLE
-        self.planning: PlanningSession | None = None
-        self.plan_result: dict | None = None
-
-    def reset(self) -> None:
-        _reset_session_state(self.state)
-        self.phase = Phase.COLLECT_SAMPLE
-        self.planning = None
-        self.plan_result = None
-
-
-_session = OrchestratorSession()
+_engine = create_transport_agnostic_engine()
 
 # -------------------------------------------------------------------------
 # MCP server
@@ -185,20 +139,193 @@ mcp = FastMCP("OpenSearch Orchestrator", json_response=True)
 # Phase tools
 # -------------------------------------------------------------------------
 
-VALID_SOURCE_TYPES = {"builtin_imdb", "local_file", "url", "localhost_index", "paste"}
-VALID_BUDGET = {_BUDGET_OPTION_FLEXIBLE, _BUDGET_OPTION_COST_SENSITIVE}
-VALID_PERFORMANCE = {_PERFORMANCE_OPTION_SPEED, _PERFORMANCE_OPTION_BALANCED, _PERFORMANCE_OPTION_ACCURACY}
-VALID_QUERY_PATTERN = {_QUERY_PATTERN_OPTION_MOSTLY_EXACT, _QUERY_PATTERN_OPTION_BALANCED, _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC}
-VALID_DEPLOYMENT = {
-    _MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE,
-    _MODEL_DEPLOYMENT_OPTION_SAGEMAKER_ENDPOINT,
-    _MODEL_DEPLOYMENT_OPTION_EXTERNAL_EMBEDDING_API,
-}
-QUERY_PATTERN_TO_HYBRID_WEIGHT = {
-    _QUERY_PATTERN_OPTION_MOSTLY_EXACT: _HYBRID_WEIGHT_OPTION_LEXICAL,
-    _QUERY_PATTERN_OPTION_BALANCED: _HYBRID_WEIGHT_OPTION_BALANCED,
-    _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC: _HYBRID_WEIGHT_OPTION_SEMANTIC,
-}
+PLANNER_MODE_ENV = "OPENSEARCH_MCP_PLANNER_MODE"
+PLANNER_MODE_CLIENT = "client"
+PLANNER_MODE_SERVER = "server"
+_PLANNING_COMPLETE_PATTERN = re.compile(
+    r"<planning_complete>(.*?)</planning_complete>",
+    re.DOTALL | re.IGNORECASE,
+)
+_SOLUTION_PATTERN = re.compile(r"<solution>(.*?)</solution>", re.DOTALL | re.IGNORECASE)
+_CAPABILITIES_PATTERN = re.compile(
+    r"<search_capabilities>(.*?)</search_capabilities>",
+    re.DOTALL | re.IGNORECASE,
+)
+_KEYNOTE_PATTERN = re.compile(r"<keynote>(.*?)</keynote>", re.DOTALL | re.IGNORECASE)
+
+
+def _resolve_planner_mode() -> str:
+    raw = str(os.getenv(PLANNER_MODE_ENV, PLANNER_MODE_CLIENT)).strip().lower()
+    if raw in {PLANNER_MODE_CLIENT, PLANNER_MODE_SERVER}:
+        return raw
+    return PLANNER_MODE_CLIENT
+
+
+def _is_method_not_found_error(exc: Exception) -> bool:
+    message = str(exc or "").lower()
+    return "method not found" in message
+
+
+def _build_current_planning_context(additional_context: str = "") -> str:
+    build_fn = getattr(_engine, "_build_planning_context", None)
+    state = getattr(_engine, "state", None)
+    if not callable(build_fn) or state is None:
+        return str(additional_context or "")
+    return str(build_fn(state, additional_context))
+
+
+def _build_manual_planner_bootstrap(additional_context: str = "") -> dict[str, str]:
+    """Build bootstrap prompts for manual client-LLM planning fallback.
+
+    MCP client-mode usage flow:
+    1. Set `OPENSEARCH_MCP_PLANNER_MODE=client`.
+    2. Call `load_sample(...)`, then `set_preferences(...)`, then `start_planning()`.
+    3. If `start_planning()` returns `manual_planning_required=true`, run planner turns
+       in the client LLM using:
+       - system message: `manual_planner_system_prompt`
+       - first user message: `manual_planner_initial_input`
+       - follow-up user feedback turns until the user confirms the plan
+    4. Commit the confirmed plan via
+       `set_plan_from_planning_complete(planner_response)`, where
+       `planner_response` includes:
+       `<planning_complete><solution>...</solution><search_capabilities>...</search_capabilities><keynote>...</keynote></planning_complete>`
+    5. Continue with `execute_plan()` (and `retry_execution()` if needed).
+    """
+    planning_context = _build_current_planning_context(additional_context)
+    parser = PlanningSession(agent=lambda _prompt: "")
+    return {
+        "manual_planner_system_prompt": PLANNER_SYSTEM_PROMPT,
+        "manual_planner_initial_input": parser._build_initial_input(planning_context),
+    }
+
+
+def _parse_planning_complete_response(response_text: str) -> dict[str, str] | dict[str, object]:
+    text = str(response_text or "")
+    match = _PLANNING_COMPLETE_PATTERN.search(text)
+    if match is None:
+        return {
+            "error": "No <planning_complete> block found.",
+            "details": [
+                "Provide the planner output containing <planning_complete>...</planning_complete>.",
+            ],
+        }
+
+    content = match.group(1)
+    solution_match = _SOLUTION_PATTERN.search(content)
+    capabilities_match = _CAPABILITIES_PATTERN.search(content)
+    keynote_match = _KEYNOTE_PATTERN.search(content)
+    solution = solution_match.group(1).strip() if solution_match else ""
+    search_capabilities = capabilities_match.group(1).strip() if capabilities_match else ""
+    keynote = keynote_match.group(1).strip() if keynote_match else ""
+    if not solution:
+        return {
+            "error": "Invalid <planning_complete> block.",
+            "details": ["<solution> is required."],
+        }
+    return {
+        "solution": solution,
+        "search_capabilities": search_capabilities,
+        "keynote": keynote,
+    }
+
+
+def _normalize_manual_plan(
+    *,
+    solution: str,
+    search_capabilities: str,
+    keynote: str,
+    additional_context: str = "",
+) -> dict[str, object]:
+    planning_context = _build_current_planning_context(additional_context)
+    parser = PlanningSession(agent=lambda _prompt: "")
+    parser._initial_context = planning_context
+    parser._confirmation_received = True
+
+    wrapped = (
+        "<planning_complete>\n"
+        "<solution>\n"
+        f"{str(solution or '').strip()}\n"
+        "</solution>\n"
+        "<search_capabilities>\n"
+        f"{str(search_capabilities or '').strip()}\n"
+        "</search_capabilities>\n"
+        "<keynote>\n"
+        f"{str(keynote or '').strip()}\n"
+        "</keynote>\n"
+        "</planning_complete>"
+    )
+    match = _PLANNING_COMPLETE_PATTERN.search(wrapped)
+    if match is None:
+        return {
+            "error": "Failed to parse manual plan.",
+            "details": ["Unable to construct <planning_complete> block for validation."],
+        }
+
+    retry_feedback = parser._try_extract_result(match)
+    if retry_feedback is not None:
+        return {
+            "error": "Manual plan failed planner validation.",
+            "details": [retry_feedback],
+            "hint": (
+                "Regenerate the planner output using the same planner prompt/initial input "
+                "and submit a corrected <planning_complete> block."
+            ),
+        }
+    result = parser._result
+    if not isinstance(result, dict):
+        return {
+            "error": "Manual plan failed planner validation.",
+            "details": ["No normalized planner result was produced."],
+        }
+    return result
+
+
+def _sampling_content_to_text(content: object) -> str:
+    if isinstance(content, mcp_types.TextContent):
+        return str(content.text or "")
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, mcp_types.TextContent):
+                text_parts.append(str(item.text or ""))
+        if text_parts:
+            return "\n".join(part for part in text_parts if part)
+    return str(content or "")
+
+
+class _ClientSamplingPlannerAgent:
+    """Planner callable that delegates generation to MCP client sampling."""
+
+    def __init__(self, ctx: Context) -> None:
+        self._session = ctx.session
+        self._messages: list[mcp_types.SamplingMessage] = []
+
+    def reset(self) -> None:
+        self._messages = []
+
+    async def __call__(self, prompt: str) -> str:
+        prompt_text = str(prompt or "").strip()
+        if prompt_text:
+            self._messages.append(
+                mcp_types.SamplingMessage(
+                    role="user",
+                    content=mcp_types.TextContent(type="text", text=prompt_text),
+                )
+            )
+
+        result = await self._session.create_message(
+            messages=self._messages,
+            max_tokens=4000,
+            system_prompt=PLANNER_SYSTEM_PROMPT,
+        )
+        assistant_text = _sampling_content_to_text(result.content)
+        self._messages.append(
+            mcp_types.SamplingMessage(
+                role="assistant",
+                content=mcp_types.TextContent(type="text", text=assistant_text),
+            )
+        )
+        return assistant_text
 
 
 def _build_ui_access_payload() -> dict[str, object]:
@@ -229,58 +356,7 @@ def load_sample(source_type: str, source_value: str = "") -> dict:
         dict with sample_doc, inferred_text_fields, text_search_required,
         and status message.
     """
-    if source_type not in VALID_SOURCE_TYPES:
-        return {"error": f"Invalid source_type '{source_type}'. Must be one of: {sorted(VALID_SOURCE_TYPES)}"}
-
-    state = _session.state
-    _clear_orchestrator_sample_state(state)
-
-    if source_type == "builtin_imdb":
-        result = submit_sample_doc_from_local_file(BUILTIN_IMDB_SAMPLE_PATH)
-    elif source_type == "local_file":
-        if not source_value:
-            return {"error": "source_value is required for local_file source_type (provide a file path)."}
-        result = submit_sample_doc_from_local_file(source_value)
-    elif source_type == "url":
-        if not source_value:
-            return {"error": "source_value is required for url source_type (provide a URL)."}
-        result = submit_sample_doc_from_url(source_value)
-    elif source_type == "localhost_index":
-        result = submit_sample_doc_from_localhost_index(source_value)
-    else:  # paste
-        if not source_value:
-            return {"error": "source_value is required for paste source_type (provide JSON content)."}
-        result = submit_sample_doc(source_value)
-
-    loaded = _capture_sample_from_result(state, result)
-
-    if not loaded:
-        if isinstance(result, str) and result.startswith("Error:"):
-            return {"error": result}
-        return {"error": f"Failed to load sample document. Raw result: {result}"}
-
-    parsed_result = json.loads(result)
-    sample_payload = parsed_result["sample_doc"]
-    state.inferred_semantic_text_fields = _infer_semantic_text_fields(sample_payload)
-    state.inferred_text_search_required = bool(state.inferred_semantic_text_fields)
-
-    source_is_localhost = bool(parsed_result.get("source_localhost_index"))
-    if source_is_localhost:
-        state.source_index_name = str(parsed_result.get("source_index_name", "")).strip() or None
-        raw_doc_count = parsed_result.get("source_index_doc_count")
-        if isinstance(raw_doc_count, int) and not isinstance(raw_doc_count, bool):
-            state.source_index_doc_count = max(0, raw_doc_count)
-
-    _session.phase = Phase.GATHER_INFO
-
-    return {
-        "status": parsed_result.get("status", "Sample loaded."),
-        "sample_doc": sample_payload,
-        "inferred_text_fields": state.inferred_semantic_text_fields,
-        "text_search_required": state.inferred_text_search_required,
-        "source_index_name": state.source_index_name,
-        "source_index_doc_count": state.source_index_doc_count,
-    }
+    return _engine.load_sample(source_type=source_type, source_value=source_value)
 
 
 @mcp.tool()
@@ -298,46 +374,22 @@ def set_preferences(
         performance: "speed-first", "balanced", or "accuracy-first".
         query_pattern: "mostly-exact", "balanced", or "mostly-semantic".
         deployment_preference: "opensearch-node", "sagemaker-endpoint", or
-            "external-embedding-api". Only needed when query_pattern is
-            "mostly-semantic". Defaults to "opensearch-node".
+            "external-embedding-api". Used when query_pattern is
+            "balanced" or "mostly-semantic". Defaults to "opensearch-node".
 
     Returns:
         dict confirming stored preferences and generated context notes.
     """
-    state = _session.state
-    if state.sample_doc_json is None:
-        return {"error": "No sample document loaded. Call load_sample first."}
-
-    budget_val = budget if budget in VALID_BUDGET else _BUDGET_OPTION_FLEXIBLE
-    perf_val = performance if performance in VALID_PERFORMANCE else _PERFORMANCE_OPTION_BALANCED
-    qp_val = query_pattern if query_pattern in VALID_QUERY_PATTERN else _QUERY_PATTERN_OPTION_BALANCED
-    hw_val = QUERY_PATTERN_TO_HYBRID_WEIGHT.get(qp_val, _HYBRID_WEIGHT_OPTION_BALANCED)
-
-    state.budget_preference = budget_val
-    state.performance_priority = perf_val
-    state.hybrid_weight_profile = hw_val
-
-    if state.inferred_text_search_required:
-        state.prefix_wildcard_enabled = False
-
-    if _is_semantic_dominant_query_pattern(hw_val) and state.inferred_text_search_required:
-        dep_val = deployment_preference if deployment_preference in VALID_DEPLOYMENT else _MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE
-        state.model_deployment_preference = dep_val
-    else:
-        state.model_deployment_preference = None
-
-    return {
-        "budget": state.budget_preference,
-        "performance": state.performance_priority,
-        "query_pattern": qp_val,
-        "hybrid_weight_profile": state.hybrid_weight_profile,
-        "deployment_preference": state.model_deployment_preference,
-        "context_notes": _build_context_notes(state),
-    }
+    return _engine.set_preferences(
+        budget=budget,
+        performance=performance,
+        query_pattern=query_pattern,
+        deployment_preference=deployment_preference,
+    )
 
 
 @mcp.tool()
-def start_planning(additional_context: str = "") -> dict:
+async def start_planning(additional_context: str = "", ctx: Context | None = None) -> dict:
     """Start the solution planning phase. Returns the planner's initial proposal.
     Call this after set_preferences.
 
@@ -347,22 +399,70 @@ def start_planning(additional_context: str = "") -> dict:
     Returns:
         dict with response text, is_complete flag, and result (if complete).
     """
-    state = _session.state
-    if state.sample_doc_json is None:
-        return {"error": "No sample loaded. Call load_sample first."}
+    planner_mode = _resolve_planner_mode()
+    if planner_mode == PLANNER_MODE_CLIENT:
+        if ctx is None:
+            return {
+                "error": "Planning failed in client mode.",
+                "details": ["MCP context is unavailable for client sampling."],
+                "hint": (
+                    "Call start_planning via an MCP client session, "
+                    f"or set `{PLANNER_MODE_ENV}={PLANNER_MODE_SERVER}`."
+                ),
+            }
+        try:
+            result = await _engine.start_planning(
+                additional_context=additional_context,
+                planning_agent=_ClientSamplingPlannerAgent(ctx),
+            )
+            result["planner_backend"] = "client_sampling"
+            return result
+        except Exception as exc:
+            if _is_method_not_found_error(exc):
+                bootstrap = _build_manual_planner_bootstrap(additional_context)
+                return {
+                    "error": "Planning failed in client mode.",
+                    "details": [f"client-sampling planner failed: {exc}"],
+                    "planner_backend": "client_manual",
+                    "manual_planning_required": True,
+                    "hint": (
+                        "The MCP client does not support `sampling/createMessage`. "
+                        "Use the returned manual planner prompt/input to generate planner turns "
+                        "with the client LLM, then call `set_plan_from_planning_complete(...)` "
+                        "after user confirmation."
+                    ),
+                    **bootstrap,
+                }
+            return {
+                "error": "Planning failed in client mode.",
+                "details": [f"client-sampling planner failed: {exc}"],
+                "hint": f"Set `{PLANNER_MODE_ENV}={PLANNER_MODE_SERVER}` to use Bedrock planner.",
+            }
 
-    context = _build_planning_context(state, additional_context)
-    _session.planning = PlanningSession()
-    result = _session.planning.start(context)
+    if planner_mode == PLANNER_MODE_SERVER:
+        try:
+            result = await _engine.start_planning(
+                additional_context=additional_context,
+            )
+            result["planner_backend"] = "server_bedrock"
+            return result
+        except Exception as exc:
+            return {
+                "error": "Planning failed in server mode.",
+                "details": [f"server planner failed: {exc}"],
+            }
 
-    if result.get("is_complete") and result.get("result"):
-        _session.plan_result = result["result"]
-
-    return result
+    return {
+        "error": "Failed to start planning.",
+        "details": [f"Unsupported planner mode: {planner_mode!r}"],
+        "hint": (
+            f"Set `{PLANNER_MODE_ENV}` to '{PLANNER_MODE_CLIENT}' or '{PLANNER_MODE_SERVER}'."
+        ),
+    }
 
 
 @mcp.tool()
-def refine_plan(user_feedback: str) -> dict:
+async def refine_plan(user_feedback: str) -> dict:
     """Send user feedback to the planner and get a refined proposal.
     Call after start_planning. Repeat as needed.
 
@@ -372,40 +472,82 @@ def refine_plan(user_feedback: str) -> dict:
     Returns:
         dict with response text, is_complete flag, and result (if complete).
     """
-    if _session.planning is None:
-        return {"error": "No planning session active. Call start_planning first."}
-
-    result = _session.planning.send(user_feedback)
-
-    if result.get("is_complete") and result.get("result"):
-        _session.plan_result = result["result"]
-
-    return result
+    return await _engine.refine_plan(user_feedback)
 
 
 @mcp.tool()
-def finalize_plan() -> dict:
+async def finalize_plan() -> dict:
     """Force the planner to finalize and return the structured plan.
     Call when the user confirms they are satisfied with the proposal.
 
     Returns:
         dict with solution, search_capabilities, and keynote.
     """
-    if _session.planning is None:
-        return {"error": "No planning session active. Call start_planning first."}
-
-    result = _session.planning.finalize()
-
-    if result.get("is_complete") and result.get("result"):
-        _session.plan_result = result["result"]
-
-    return result
+    return await _engine.finalize_plan()
 
 
 @mcp.tool()
-def execute_plan(additional_context: str = "") -> dict:
+def set_plan(solution: str, search_capabilities: str = "", keynote: str = "") -> dict:
+    """Store a client-authored finalized plan for execution after planner validation.
+    Call this when the MCP client cannot run `start_planning` via client sampling
+    and the client LLM authored the proposal directly.
+
+    Args:
+        solution: Finalized architecture plan text.
+        search_capabilities: Search capability section text.
+        keynote: Key assumptions and caveats.
+
+    Returns:
+        dict with status and stored normalized plan.
+    """
+    normalized = _normalize_manual_plan(
+        solution=solution,
+        search_capabilities=search_capabilities,
+        keynote=keynote,
+    )
+    if "error" in normalized:
+        return normalized
+    return _engine.set_plan(
+        solution=str(normalized.get("solution", "")),
+        search_capabilities=str(normalized.get("search_capabilities", "")),
+        keynote=str(normalized.get("keynote", "")),
+    )
+
+
+@mcp.tool()
+def set_plan_from_planning_complete(planner_response: str, additional_context: str = "") -> dict:
+    """Parse and store planner output from a `<planning_complete>` block.
+    Preferred manual-mode commit path when `manual_planning_required=true`.
+
+    Args:
+        planner_response: Full planner response text containing `<planning_complete>`.
+        additional_context: Optional context to include for normalization/validation.
+
+    Returns:
+        dict with status and stored normalized plan, or validation feedback.
+    """
+    parsed = _parse_planning_complete_response(planner_response)
+    if "error" in parsed:
+        return parsed
+    normalized = _normalize_manual_plan(
+        solution=str(parsed.get("solution", "")),
+        search_capabilities=str(parsed.get("search_capabilities", "")),
+        keynote=str(parsed.get("keynote", "")),
+        additional_context=additional_context,
+    )
+    if "error" in normalized:
+        return normalized
+    return _engine.set_plan(
+        solution=str(normalized.get("solution", "")),
+        search_capabilities=str(normalized.get("search_capabilities", "")),
+        keynote=str(normalized.get("keynote", "")),
+    )
+
+
+@mcp.tool()
+async def execute_plan(additional_context: str = "") -> dict:
     """Execute the finalized solution plan (create index, models, pipelines, UI).
-    Call after finalize_plan.
+    Call after finalize_plan, set_plan, or set_plan_from_planning_complete.
 
     Args:
         additional_context: Optional extra instructions for the worker.
@@ -413,52 +555,30 @@ def execute_plan(additional_context: str = "") -> dict:
     Returns:
         dict with worker execution report and UI access URLs.
     """
-    if _session.plan_result is None:
-        return {"error": "No finalized plan available. Complete the planning phase first."}
-
-    plan = _session.plan_result
-    solution = plan.get("solution", "")
-    capabilities = plan.get("search_capabilities", "")
-    keynote = plan.get("keynote", "")
-
-    worker_context = f"Solution:\n{solution}\n\nSearch Capabilities:\n{capabilities}\n\nKeynote:\n{keynote}"
-    if additional_context:
-        worker_context += f"\n\n{additional_context}"
-
-    worker_result = _run_worker_agent_with_state(_session.state, worker_context)
-    _session.phase = Phase.DONE
-
+    result = await _engine.execute_plan(
+        additional_context=additional_context,
+    )
+    if "error" in result:
+        return result
     return {
-        "execution_report": worker_result,
+        "execution_report": result["execution_report"],
         "ui_access": _build_ui_access_payload(),
     }
 
 
 @mcp.tool()
-def retry_execution() -> dict:
+async def retry_execution() -> dict:
     """Retry execution from the last failed step.
     Call after execute_plan fails and the user has fixed the issue.
 
     Returns:
         dict with worker execution report and UI access URLs.
     """
-    worker_state = get_last_worker_run_state()
-    recovery_context = str(worker_state.get("context", "")).strip() if isinstance(worker_state, dict) else ""
-
-    if not recovery_context:
-        return {"error": "No checkpoint context available. Run execute_plan first."}
-
-    worker_result = _run_worker_agent_with_state(
-        _session.state,
-        f"{_RESUME_WORKER_MARKER}\n{recovery_context}",
-    )
-
-    latest_state = get_last_worker_run_state()
-    latest_status = str(latest_state.get("status", "")).lower()
-    _session.phase = Phase.DONE if latest_status == "success" else Phase.EXEC_FAILED
-
+    result = await _engine.retry_execution()
+    if "error" in result:
+        return result
     return {
-        "execution_report": worker_result,
+        "execution_report": result["execution_report"],
         "ui_access": _build_ui_access_payload(),
     }
 
@@ -472,84 +592,6 @@ def cleanup_verification() -> str:
         str: Cleanup result message.
     """
     return cleanup_verification_docs()
-
-
-# -------------------------------------------------------------------------
-# Context building helpers
-# -------------------------------------------------------------------------
-
-
-def _build_context_notes(state: SessionState) -> str:
-    """Build the full requirement notes context block from session state."""
-    notes: list[str] = [
-        _DEFAULT_QUERY_FEATURES_NOTE,
-        _build_text_search_use_case_note(
-            state.inferred_text_search_required,
-            state.inferred_semantic_text_fields,
-        ),
-        _MODEL_DEPLOYMENT_SCOPE_NOTE,
-        _PERFORMANCE_PRIORITY_SCOPE_NOTE,
-        _SAMPLE_FINAL_TRUTH_NOTE,
-        _SEMANTIC_EXPANSION_EXPLANATION_NOTE,
-        _MAPPING_CLARITY_FEEDBACK_NOTE,
-        _DEFAULT_SPECIFIC_USE_CASES_NOTE,
-        _DEFAULT_QUERY_SUPPORT_SCOPE_NOTE,
-        _DEFAULT_DASHBOARD_REQUIREMENT_NOTE,
-        _DEFAULT_REALTIME_REQUIREMENT_NOTE,
-        _DEFAULT_CUSTOM_REQUIREMENTS_NOTE,
-    ]
-
-    if (
-        state.inferred_text_search_required
-        and _is_semantic_dominant_query_pattern(state.hybrid_weight_profile)
-    ):
-        notes.append(_NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE)
-
-    if state.budget_preference:
-        notes.append(_build_budget_preference_note(state.budget_preference))
-    if state.performance_priority:
-        notes.append(_build_performance_preference_note(state.performance_priority))
-    if state.hybrid_weight_profile:
-        notes.append(_build_semantic_query_pattern_preference_note(state.hybrid_weight_profile))
-    if state.prefix_wildcard_enabled is not None:
-        notes.append(_build_prefix_wildcard_requirement_note(state.prefix_wildcard_enabled))
-    if state.model_deployment_preference:
-        notes.append(_build_model_deployment_preference_note(state.model_deployment_preference))
-    if state.hybrid_weight_profile:
-        notes.append(_build_hybrid_weight_profile_note(state.hybrid_weight_profile))
-
-    return "\n".join(notes)
-
-
-def _build_planning_context(state: SessionState, additional_context: str = "") -> str:
-    """Build the full context string for the planning agent."""
-    parts: list[str] = []
-
-    if state.sample_doc_json:
-        parts.append(f"Sample document: {state.sample_doc_json}")
-
-    if state.source_index_name:
-        parts.append(
-            f"Execution policy: source is localhost OpenSearch index "
-            f"'{state.source_index_name}' (system-enforced, not user-stated); "
-            "if target index already exists during setup, "
-            "do NOT recreate it (replace_if_exists=false). "
-            "Use a different target index name."
-        )
-        if isinstance(state.source_index_doc_count, int):
-            parts.append(
-                "Requirements note: exact current document count already measured "
-                f"from OpenSearch count API: {state.source_index_doc_count:,}. "
-                "Do NOT ask current-count or growth-projection questions. "
-                "Assume this is representative sample data and ingestion will continue."
-            )
-
-    parts.append(_build_context_notes(state))
-
-    if additional_context:
-        parts.append(additional_context)
-
-    return "\n\n".join(parts)
 
 
 # -------------------------------------------------------------------------
@@ -587,7 +629,7 @@ mcp.tool()(index_doc)
 mcp.tool()(index_verification_docs)
 mcp.tool()(delete_doc)
 mcp.tool()(apply_capability_driven_verification)
-mcp.tool()(preview_capability_driven_verification)
+mcp.tool()(preview_cap_driven_verification)
 mcp.tool()(launch_search_ui)
 mcp.tool()(cleanup_ui_server)
 mcp.tool()(set_search_ui_suggestions)

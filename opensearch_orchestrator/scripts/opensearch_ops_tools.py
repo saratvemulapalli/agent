@@ -2601,7 +2601,7 @@ def _evaluate_capability_driven_selection(
     return result
 
 
-def preview_capability_driven_verification(
+def preview_cap_driven_verification(
     worker_output: str,
     count: int = 10,
     sample_doc_json: str = "",

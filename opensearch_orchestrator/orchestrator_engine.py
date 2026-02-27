@@ -1,0 +1,382 @@
+"""Transport-agnostic orchestration engine shared by CLI and MCP adapters."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from opensearch_orchestrator.scripts.shared import Phase
+
+
+class OrchestratorEngine:
+    """Stateful workflow engine for sample -> preferences -> planning -> execution."""
+
+    def __init__(
+        self,
+        *,
+        state: Any,
+        clear_sample_state: Any,
+        reset_state: Any,
+        capture_sample_from_result: Any,
+        infer_semantic_text_fields: Any,
+        is_semantic_dominant_query_pattern: Any,
+        build_context_notes: Any,
+        build_planning_context: Any,
+        run_worker_with_state: Any,
+        get_last_worker_run_state: Any,
+        planning_session_factory: Any,
+        load_builtin_sample: Any,
+        load_local_file_sample: Any,
+        load_url_sample: Any,
+        load_localhost_index_sample: Any,
+        load_pasted_sample: Any,
+        budget_option_flexible: str,
+        budget_option_cost_sensitive: str,
+        performance_option_speed: str,
+        performance_option_balanced: str,
+        performance_option_accuracy: str,
+        query_pattern_option_mostly_exact: str,
+        query_pattern_option_balanced: str,
+        query_pattern_option_mostly_semantic: str,
+        model_deployment_option_opensearch_node: str,
+        model_deployment_option_sagemaker_endpoint: str,
+        model_deployment_option_external_embedding_api: str,
+        hybrid_weight_option_semantic: str,
+        hybrid_weight_option_balanced: str,
+        hybrid_weight_option_lexical: str,
+        resume_marker: str,
+    ) -> None:
+        self.state = state
+        self.phase = Phase.COLLECT_SAMPLE
+        self.planning = None
+        self.plan_result: dict | None = None
+
+        self._clear_sample_state = clear_sample_state
+        self._reset_state = reset_state
+        self._capture_sample_from_result = capture_sample_from_result
+        self._infer_semantic_text_fields = infer_semantic_text_fields
+        self._is_semantic_dominant_query_pattern = is_semantic_dominant_query_pattern
+        self._build_context_notes = build_context_notes
+        self._build_planning_context = build_planning_context
+        self._run_worker_with_state = run_worker_with_state
+        self._get_last_worker_run_state = get_last_worker_run_state
+        self._planning_session_factory = planning_session_factory
+
+        self._load_builtin_sample = load_builtin_sample
+        self._load_local_file_sample = load_local_file_sample
+        self._load_url_sample = load_url_sample
+        self._load_localhost_index_sample = load_localhost_index_sample
+        self._load_pasted_sample = load_pasted_sample
+
+        self._valid_source_types = {
+            "builtin_imdb",
+            "local_file",
+            "url",
+            "localhost_index",
+            "paste",
+        }
+        self._valid_budget = {
+            budget_option_flexible,
+            budget_option_cost_sensitive,
+        }
+        self._valid_performance = {
+            performance_option_speed,
+            performance_option_balanced,
+            performance_option_accuracy,
+        }
+        self._valid_query_pattern = {
+            query_pattern_option_mostly_exact,
+            query_pattern_option_balanced,
+            query_pattern_option_mostly_semantic,
+        }
+        self._deployment_required_query_patterns = {
+            query_pattern_option_balanced,
+            query_pattern_option_mostly_semantic,
+        }
+        self._valid_deployment = {
+            model_deployment_option_opensearch_node,
+            model_deployment_option_sagemaker_endpoint,
+            model_deployment_option_external_embedding_api,
+        }
+        self._query_pattern_to_hybrid_weight = {
+            query_pattern_option_mostly_exact: hybrid_weight_option_lexical,
+            query_pattern_option_balanced: hybrid_weight_option_balanced,
+            query_pattern_option_mostly_semantic: hybrid_weight_option_semantic,
+        }
+        self._default_budget = budget_option_flexible
+        self._default_performance = performance_option_balanced
+        self._default_query_pattern = query_pattern_option_balanced
+        self._default_deployment = model_deployment_option_opensearch_node
+        self._resume_marker = resume_marker
+
+    def reset(self) -> None:
+        self._reset_state(self.state)
+        self.phase = Phase.COLLECT_SAMPLE
+        self.planning = None
+        self.plan_result = None
+
+    def load_sample(self, source_type: str, source_value: str = "") -> dict:
+        if source_type not in self._valid_source_types:
+            return {
+                "error": (
+                    f"Invalid source_type '{source_type}'. Must be one of: "
+                    f"{sorted(self._valid_source_types)}"
+                )
+            }
+
+        state = self.state
+        self._clear_sample_state(state)
+
+        if source_type == "builtin_imdb":
+            result = self._load_builtin_sample()
+        elif source_type == "local_file":
+            if not source_value:
+                return {
+                    "error": (
+                        "source_value is required for local_file source_type "
+                        "(provide a file path)."
+                    )
+                }
+            result = self._load_local_file_sample(source_value)
+        elif source_type == "url":
+            if not source_value:
+                return {
+                    "error": (
+                        "source_value is required for url source_type "
+                        "(provide a URL)."
+                    )
+                }
+            result = self._load_url_sample(source_value)
+        elif source_type == "localhost_index":
+            result = self._load_localhost_index_sample(source_value)
+        else:
+            if not source_value:
+                return {
+                    "error": (
+                        "source_value is required for paste source_type "
+                        "(provide JSON content)."
+                    )
+                }
+            result = self._load_pasted_sample(source_value)
+
+        loaded = self._capture_sample_from_result(state, result)
+        if not loaded:
+            if isinstance(result, str) and result.startswith("Error:"):
+                return {"error": result}
+            return {"error": f"Failed to load sample document. Raw result: {result}"}
+
+        parsed_result = json.loads(result)
+        sample_payload = parsed_result["sample_doc"]
+        state.inferred_semantic_text_fields = self._infer_semantic_text_fields(sample_payload)
+        state.inferred_text_search_required = bool(state.inferred_semantic_text_fields)
+
+        source_is_localhost = bool(parsed_result.get("source_localhost_index"))
+        if source_is_localhost:
+            state.source_index_name = str(parsed_result.get("source_index_name", "")).strip() or None
+            raw_doc_count = parsed_result.get("source_index_doc_count")
+            if isinstance(raw_doc_count, int) and not isinstance(raw_doc_count, bool):
+                state.source_index_doc_count = max(0, raw_doc_count)
+
+        self.phase = Phase.GATHER_INFO
+        return {
+            "status": parsed_result.get("status", "Sample loaded."),
+            "sample_doc": sample_payload,
+            "inferred_text_fields": state.inferred_semantic_text_fields,
+            "text_search_required": state.inferred_text_search_required,
+            "source_index_name": state.source_index_name,
+            "source_index_doc_count": state.source_index_doc_count,
+        }
+
+    def set_preferences(
+        self,
+        *,
+        budget: str = "flexible",
+        performance: str = "balanced",
+        query_pattern: str = "balanced",
+        deployment_preference: str = "",
+    ) -> dict:
+        state = self.state
+        if state.sample_doc_json is None:
+            return {"error": "No sample document loaded. Call load_sample first."}
+
+        budget_val = budget if budget in self._valid_budget else self._default_budget
+        perf_val = performance if performance in self._valid_performance else self._default_performance
+        qp_val = (
+            query_pattern
+            if query_pattern in self._valid_query_pattern
+            else self._default_query_pattern
+        )
+        hw_val = self._query_pattern_to_hybrid_weight.get(qp_val, self._query_pattern_to_hybrid_weight[self._default_query_pattern])
+
+        state.budget_preference = budget_val
+        state.performance_priority = perf_val
+        state.hybrid_weight_profile = hw_val
+
+        if state.inferred_text_search_required and state.prefix_wildcard_enabled is None:
+            state.prefix_wildcard_enabled = False
+
+        if (
+            qp_val in self._deployment_required_query_patterns
+            and state.inferred_text_search_required
+        ):
+            dep_val = (
+                deployment_preference
+                if deployment_preference in self._valid_deployment
+                else self._default_deployment
+            )
+            state.model_deployment_preference = dep_val
+        else:
+            state.model_deployment_preference = None
+
+        return {
+            "budget": state.budget_preference,
+            "performance": state.performance_priority,
+            "query_pattern": qp_val,
+            "hybrid_weight_profile": state.hybrid_weight_profile,
+            "deployment_preference": state.model_deployment_preference,
+            "context_notes": self._build_context_notes(state),
+        }
+
+    async def start_planning(
+        self,
+        *,
+        additional_context: str = "",
+        planning_agent: Any = None,
+    ) -> dict:
+        state = self.state
+        if state.sample_doc_json is None:
+            return {"error": "No sample loaded. Call load_sample first."}
+
+        context = self._build_planning_context(state, additional_context)
+        self.plan_result = None
+        if planning_agent is None:
+            self.planning = self._planning_session_factory()
+        else:
+            self.planning = self._planning_session_factory(agent=planning_agent)
+
+        if hasattr(self.planning, "astart"):
+            result = await self.planning.astart(context)
+        else:
+            result = self.planning.start(context)
+
+        if result.get("is_complete") and result.get("result"):
+            self.plan_result = result["result"]
+        return result
+
+    async def refine_plan(self, user_feedback: str) -> dict:
+        if self.planning is None:
+            return {"error": "No planning session active. Call start_planning first."}
+
+        if hasattr(self.planning, "asend"):
+            result = await self.planning.asend(user_feedback)
+        else:
+            result = self.planning.send(user_feedback)
+
+        if result.get("is_complete") and result.get("result"):
+            self.plan_result = result["result"]
+        return result
+
+    async def finalize_plan(self) -> dict:
+        if self.planning is None:
+            return {"error": "No planning session active. Call start_planning first."}
+
+        if hasattr(self.planning, "afinalize"):
+            result = await self.planning.afinalize()
+        else:
+            result = self.planning.finalize()
+
+        if result.get("is_complete") and result.get("result"):
+            self.plan_result = result["result"]
+        return result
+
+    async def execute_plan(
+        self,
+        *,
+        additional_context: str = "",
+        worker_executor: Any = None,
+        worker_executor_async: Any = None,
+    ) -> dict:
+        if self.plan_result is None:
+            return {
+                "error": "No finalized plan available. Complete the planning phase first."
+            }
+
+        plan = self.plan_result
+        solution = plan.get("solution", "")
+        capabilities = plan.get("search_capabilities", "")
+        keynote = plan.get("keynote", "")
+
+        worker_context = (
+            f"Solution:\n{solution}\n\n"
+            f"Search Capabilities:\n{capabilities}\n\n"
+            f"Keynote:\n{keynote}"
+        )
+        if additional_context:
+            worker_context += f"\n\n{additional_context}"
+
+        if worker_executor_async is not None:
+            worker_result = await worker_executor_async(worker_context)
+        elif worker_executor is not None:
+            worker_result = worker_executor(self.state, worker_context)
+        else:
+            worker_result = self._run_worker_with_state(self.state, worker_context)
+
+        self.phase = Phase.DONE
+        return {"execution_report": worker_result}
+
+    def set_plan(
+        self,
+        *,
+        solution: str,
+        search_capabilities: str = "",
+        keynote: str = "",
+    ) -> dict:
+        """Store a client-authored finalized plan for later execution.
+
+        This is used by MCP clients that do not support server->client sampling.
+        The client LLM can author the plan and commit it through an explicit tool call.
+        """
+        if self.state.sample_doc_json is None:
+            return {"error": "No sample loaded. Call load_sample first."}
+
+        clean_solution = str(solution or "").strip()
+        if not clean_solution:
+            return {"error": "solution is required and cannot be empty."}
+
+        self.plan_result = {
+            "solution": clean_solution,
+            "search_capabilities": str(search_capabilities or "").strip(),
+            "keynote": str(keynote or "").strip(),
+        }
+        return {
+            "status": "Plan stored.",
+            "result": self.plan_result,
+        }
+
+    async def retry_execution(
+        self,
+        *,
+        worker_executor: Any = None,
+        worker_executor_async: Any = None,
+    ) -> dict:
+        worker_state = self._get_last_worker_run_state()
+        recovery_context = (
+            str(worker_state.get("context", "")).strip()
+            if isinstance(worker_state, dict)
+            else ""
+        )
+        if not recovery_context:
+            return {"error": "No checkpoint context available. Run execute_plan first."}
+
+        resume_context = f"{self._resume_marker}\n{recovery_context}"
+        if worker_executor_async is not None:
+            worker_result = await worker_executor_async(resume_context)
+        elif worker_executor is not None:
+            worker_result = worker_executor(self.state, resume_context)
+        else:
+            worker_result = self._run_worker_with_state(self.state, resume_context)
+
+        latest_state = self._get_last_worker_run_state()
+        latest_status = str(latest_state.get("status", "")).lower()
+        self.phase = Phase.DONE if latest_status == "success" else Phase.EXEC_FAILED
+        return {"execution_report": worker_result}

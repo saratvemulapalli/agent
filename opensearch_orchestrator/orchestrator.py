@@ -43,6 +43,8 @@ from opensearch_orchestrator.scripts.shared import (
 )
 from opensearch_orchestrator.scripts.opensearch_ops_tools import cleanup_verification_docs
 from opensearch_orchestrator.solution_planning_assistant import solution_planning_assistant, reset_planner_agent
+from opensearch_orchestrator.planning_session import PlanningSession
+from opensearch_orchestrator.orchestrator_engine import OrchestratorEngine
 from opensearch_orchestrator.worker import (
     worker_agent as worker_agent_impl,
     _extract_sample_doc_json as worker_extract_sample_doc_json,
@@ -93,9 +95,9 @@ Your goal is to guide the user from initial requirements to a finalized, execute
     *   **Performance vs Accuracy Priority**: Use a single-choice selection with exactly three options: `speed-first`, `balanced`, `accuracy-first`. Do NOT ask explicit response-time/P99 targets unless the user explicitly requests SLA-driven tuning.
     *   **Semantic Search Query-Pattern Preference (pre-planning)**: If text-based search is in scope, ask this once during requirement clarification before calling `solution_planning_assistant`.
         Use a fixed three-option query-pattern choice:
-        - Queries are mostly exact / navigational (IDs, names, short queries)
-        - Balanced (default)
-        - Queries are mostly natural language / semantic
+        - Mostly exact keywords (like "Carmencita 1894")
+        - Semantic / natural language (like "early silent films about dancers")
+        - Balanced mix of both (default)
         If pre-processing already provided either
         `Requirements note: semantic query-pattern preference = ...` or `Hybrid Weight Profile: ...`,
         treat query-pattern preference as already collected and do NOT ask again.
@@ -105,8 +107,8 @@ Your goal is to guide the user from initial requirements to a finalized, execute
     *   **Mapping-Clarity Assumption**: Do NOT ask whether mapping guidance is clear (including `isAdult` typing guidance). Assume users will raise concerns if needed.
     *   **Semantic Expansion Explanation Assumption**: Assume no proactive deep-dive explanation is desired. Do NOT ask whether the user wants more semantic-expansion explanation unless the user explicitly asks for details.
     *   **Model Deployment (Production)**: OpenSearch node, SageMaker endpoint, and external embedding API deployments are all valid.
-        Ask the deployment-preference question only when the selected query pattern is semantic-dominant
-        (mostly natural language / semantic).
+        Ask the deployment-preference question when the selected query pattern is balanced
+        or semantic-dominant (mostly natural language / semantic).
     *   **Launch UI Execution Scope**: Launch UI setup provisions only local OpenSearch-hosted pretrained models (dense or sparse).
         Treat this as tooling scope, not as a user rejection of SageMaker/external APIs.
     *   **Query Features (Conditional Prefix/Wildcard)**: Assume range queries and aggregations/facets are required by default. Include geospatial search only when lat/lon fields exist in the sample/schema.
@@ -150,7 +152,7 @@ Your goal is to guide the user from initial requirements to a finalized, execute
 *   **Sample Doc Gate**: A sample document must exist before clarification/planning. When the message says a sample is pre-loaded, proceed directly — do not re-collect.
 *   **No Redundant Questions**: Do not ask users to restate values already inferred from source profile/sample data. Only ask confirmation or forward-looking deltas.
 *   **Performance Question Scope**: Do not ask a separate numeric latency-target question. Use only the speed-vs-accuracy priority question unless the user explicitly asks for P99/SLA tuning.
-*   **Multiple-Choice Clarifications**: For budget, performance priority, semantic-search query-pattern preference (before solution planning when text-based search is in scope), and production model deployment preference (only when the query-pattern preference is semantic-dominant), use fixed option selection format, not free-text prompts.
+*   **Multiple-Choice Clarifications**: For budget, performance priority, semantic-search query-pattern preference (before solution planning when text-based search is in scope), and production model deployment preference (when the query-pattern preference is balanced or semantic-dominant), use fixed option selection format, not free-text prompts.
 *   **Pre-Collected Query Pattern**: If `Requirements note: semantic query-pattern preference = ...` or `Hybrid Weight Profile: ...` appears in system context, query-pattern preference is already resolved. Do not ask a duplicate query-pattern question.
 *   **Default Query Features**: Treat range queries and aggregations/facets as required baseline capabilities. Geospatial is conditional: include only if lat/lon fields exist in sample/schema.
 *   **Prefix/Wildcard Scope**: Do NOT ask a clarification question for prefix/wildcard matching. Assume it is disabled unless the user explicitly requests it. If enabled, treat lexical BM25 capability as required. If disabled, do not force BM25 solely for prefix/wildcard support.
@@ -227,7 +229,8 @@ _DEFAULT_QUERY_FEATURES_NOTE = (
 )
 _MODEL_DEPLOYMENT_SCOPE_NOTE = (
     "Requirements note: production model deployment options include OpenSearch node, SageMaker endpoint, "
-    "and external embedding APIs. If semantic retrieval is used, capture/reflect the preferred production deployment mode. "
+    "and external embedding APIs. If query-pattern preference is balanced or mostly-semantic, "
+    "capture/reflect the preferred production deployment mode. "
     "Execution policy: Launch UI setup provisions local OpenSearch-hosted pretrained models only "
     "(dense or sparse) for bootstrap."
 )
@@ -502,9 +505,7 @@ def _build_semantic_query_pattern_prompt(
 ) -> str:
     """Build semantic query-pattern prompt with optional text-field context."""
     preview = _extract_text_field_preview(candidate_fields, max_fields=max_fields)
-    question = (
-        "For your semantic search use cases, which best describes the typical user query style?"
-    )
+    question = "Query pattern: How do you expect users to search?"
     if preview:
         return f"From your sample data, fields like {preview} look text-heavy.\n\n{question}"
     return question
@@ -603,6 +604,17 @@ def _is_semantic_dominant_query_pattern(profile: str | None) -> bool:
     }
 
 
+def _requires_model_deployment_preference(profile: str | None) -> bool:
+    """Return True when deployment preference should be collected for query pattern."""
+    normalized = str(profile or "").strip().lower()
+    return normalized in {
+        _HYBRID_WEIGHT_OPTION_BALANCED,
+        _HYBRID_WEIGHT_OPTION_SEMANTIC,
+        _QUERY_PATTERN_OPTION_BALANCED,
+        _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC,
+    }
+
+
 def _build_hybrid_weight_profile_note(profile: str) -> str:
     """Build canonical hybrid-weight profile line for planner/worker context."""
     normalized = str(profile or "").strip().lower()
@@ -625,15 +637,15 @@ def _read_hybrid_weight_profile_choice(
         options=[
             (
                 _QUERY_PATTERN_OPTION_MOSTLY_EXACT,
-                "Queries are mostly exact / navigational (IDs, names, short queries)",
-            ),
-            (
-                _QUERY_PATTERN_OPTION_BALANCED,
-                "Balanced (default)",
+                'Mostly exact keywords (like "Carmencita 1894")',
             ),
             (
                 _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC,
-                "Queries are mostly natural language / semantic",
+                'Semantic/natural language (like "early silent films about dancers")',
+            ),
+            (
+                _QUERY_PATTERN_OPTION_BALANCED,
+                "Balanced mix of both (default)",
             ),
         ],
         default_value=_QUERY_PATTERN_OPTION_BALANCED,
@@ -927,6 +939,178 @@ def _run_worker_agent_with_state(state: SessionState, context: str) -> str:
 
 
 # -------------------------------------------------------------------------
+# Shared Context Builders (used by CLI + MCP engine)
+# -------------------------------------------------------------------------
+
+def _iter_context_note_entries(state: SessionState) -> list[tuple[str, str]]:
+    """Return ordered `(prefix, note)` entries for requirements context."""
+    entries: list[tuple[str, str]] = [
+        (_DEFAULT_QUERY_FEATURES_NOTE_PREFIX, _DEFAULT_QUERY_FEATURES_NOTE),
+        (
+            _TEXT_SEARCH_USE_CASE_NOTE_PREFIX,
+            _build_text_search_use_case_note(
+                state.inferred_text_search_required,
+                state.inferred_semantic_text_fields,
+            ),
+        ),
+        (_MODEL_DEPLOYMENT_SCOPE_NOTE_PREFIX, _MODEL_DEPLOYMENT_SCOPE_NOTE),
+        (_PERFORMANCE_PRIORITY_SCOPE_NOTE_PREFIX, _PERFORMANCE_PRIORITY_SCOPE_NOTE),
+        (_SAMPLE_FINAL_TRUTH_NOTE_PREFIX, _SAMPLE_FINAL_TRUTH_NOTE),
+        (_SEMANTIC_EXPANSION_EXPLANATION_NOTE_PREFIX, _SEMANTIC_EXPANSION_EXPLANATION_NOTE),
+        (_MAPPING_CLARITY_FEEDBACK_NOTE_PREFIX, _MAPPING_CLARITY_FEEDBACK_NOTE),
+        (_DEFAULT_SPECIFIC_USE_CASES_NOTE_PREFIX, _DEFAULT_SPECIFIC_USE_CASES_NOTE),
+        (_DEFAULT_QUERY_SUPPORT_SCOPE_NOTE_PREFIX, _DEFAULT_QUERY_SUPPORT_SCOPE_NOTE),
+        (_DEFAULT_DASHBOARD_REQUIREMENT_NOTE_PREFIX, _DEFAULT_DASHBOARD_REQUIREMENT_NOTE),
+        (_DEFAULT_REALTIME_REQUIREMENT_NOTE_PREFIX, _DEFAULT_REALTIME_REQUIREMENT_NOTE),
+        (_DEFAULT_CUSTOM_REQUIREMENTS_NOTE_PREFIX, _DEFAULT_CUSTOM_REQUIREMENTS_NOTE),
+    ]
+
+    if (
+        state.inferred_text_search_required
+        and _is_semantic_dominant_query_pattern(state.hybrid_weight_profile)
+    ):
+        entries.append(
+            (_NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE_PREFIX, _NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE)
+        )
+
+    if state.budget_preference:
+        entries.append(
+            (
+                _BUDGET_PREFERENCE_NOTE_PREFIX,
+                _build_budget_preference_note(state.budget_preference),
+            )
+        )
+    if state.performance_priority:
+        entries.append(
+            (
+                _PERFORMANCE_PREFERENCE_NOTE_PREFIX,
+                _build_performance_preference_note(state.performance_priority),
+            )
+        )
+    if state.hybrid_weight_profile:
+        entries.append(
+            (
+                _SEMANTIC_QUERY_PATTERN_PREFERENCE_NOTE_PREFIX,
+                _build_semantic_query_pattern_preference_note(state.hybrid_weight_profile),
+            )
+        )
+        entries.append(
+            (
+                _HYBRID_WEIGHT_PROFILE_PREFIX,
+                _build_hybrid_weight_profile_note(state.hybrid_weight_profile),
+            )
+        )
+    if state.prefix_wildcard_enabled is not None:
+        entries.append(
+            (
+                _PREFIX_WILDCARD_REQUIREMENT_NOTE_PREFIX,
+                _build_prefix_wildcard_requirement_note(state.prefix_wildcard_enabled),
+            )
+        )
+    if state.model_deployment_preference:
+        entries.append(
+            (
+                _MODEL_DEPLOYMENT_PREFERENCE_NOTE_PREFIX,
+                _build_model_deployment_preference_note(state.model_deployment_preference),
+            )
+        )
+
+    return entries
+
+
+def _build_localhost_execution_policy_note(state: SessionState) -> str | None:
+    if not state.source_index_name:
+        return None
+    return (
+        "Execution policy: source is localhost OpenSearch index "
+        f"'{state.source_index_name}' (system-enforced, not user-stated); "
+        "if target index already exists during setup, "
+        "do NOT recreate it (replace_if_exists=false). "
+        "Use a different target index name."
+    )
+
+
+def _build_localhost_doc_count_note(state: SessionState) -> str | None:
+    if not isinstance(state.source_index_doc_count, int):
+        return None
+    return (
+        "Requirements note: exact current document count already measured "
+        f"from OpenSearch count API: {state.source_index_doc_count:,}. "
+        "Do NOT ask current-count or growth-projection questions. "
+        "Assume this is representative sample data and ingestion will continue."
+    )
+
+
+def _build_context_notes(state: SessionState) -> str:
+    """Build the full requirement notes context block from session state."""
+    return "\n".join(note for _, note in _iter_context_note_entries(state))
+
+
+def _build_planning_context(state: SessionState, additional_context: str = "") -> str:
+    """Build the full context string for the planning agent."""
+    parts: list[str] = []
+
+    if state.sample_doc_json:
+        parts.append(f"Sample document: {state.sample_doc_json}")
+
+    if state.source_index_name:
+        policy_note = _build_localhost_execution_policy_note(state)
+        if policy_note:
+            parts.append(policy_note)
+        doc_count_note = _build_localhost_doc_count_note(state)
+        if doc_count_note:
+            parts.append(doc_count_note)
+
+    parts.append(_build_context_notes(state))
+
+    if additional_context:
+        parts.append(additional_context)
+
+    return "\n\n".join(parts)
+
+
+def create_transport_agnostic_engine(
+    state: SessionState | None = None,
+) -> OrchestratorEngine:
+    """Create shared orchestration engine used by CLI and MCP adapters."""
+    effective_state = state or SessionState()
+
+    return OrchestratorEngine(
+        state=effective_state,
+        clear_sample_state=_clear_orchestrator_sample_state,
+        reset_state=_reset_session_state,
+        capture_sample_from_result=_capture_sample_from_result,
+        infer_semantic_text_fields=_infer_semantic_text_fields,
+        is_semantic_dominant_query_pattern=_is_semantic_dominant_query_pattern,
+        build_context_notes=_build_context_notes,
+        build_planning_context=_build_planning_context,
+        run_worker_with_state=_run_worker_agent_with_state,
+        get_last_worker_run_state=get_last_worker_run_state,
+        planning_session_factory=PlanningSession,
+        load_builtin_sample=lambda: submit_sample_doc_from_local_file(BUILTIN_IMDB_SAMPLE_PATH),
+        load_local_file_sample=submit_sample_doc_from_local_file,
+        load_url_sample=submit_sample_doc_from_url,
+        load_localhost_index_sample=submit_sample_doc_from_localhost_index,
+        load_pasted_sample=submit_sample_doc,
+        budget_option_flexible=_BUDGET_OPTION_FLEXIBLE,
+        budget_option_cost_sensitive=_BUDGET_OPTION_COST_SENSITIVE,
+        performance_option_speed=_PERFORMANCE_OPTION_SPEED,
+        performance_option_balanced=_PERFORMANCE_OPTION_BALANCED,
+        performance_option_accuracy=_PERFORMANCE_OPTION_ACCURACY,
+        query_pattern_option_mostly_exact=_QUERY_PATTERN_OPTION_MOSTLY_EXACT,
+        query_pattern_option_balanced=_QUERY_PATTERN_OPTION_BALANCED,
+        query_pattern_option_mostly_semantic=_QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC,
+        model_deployment_option_opensearch_node=_MODEL_DEPLOYMENT_OPTION_OPENSEARCH_NODE,
+        model_deployment_option_sagemaker_endpoint=_MODEL_DEPLOYMENT_OPTION_SAGEMAKER_ENDPOINT,
+        model_deployment_option_external_embedding_api=_MODEL_DEPLOYMENT_OPTION_EXTERNAL_EMBEDDING_API,
+        hybrid_weight_option_semantic=_HYBRID_WEIGHT_OPTION_SEMANTIC,
+        hybrid_weight_option_balanced=_HYBRID_WEIGHT_OPTION_BALANCED,
+        hybrid_weight_option_lexical=_HYBRID_WEIGHT_OPTION_LEXICAL,
+        resume_marker=_RESUME_WORKER_MARKER,
+    )
+
+
+# -------------------------------------------------------------------------
 # Agent Factory
 # -------------------------------------------------------------------------
 
@@ -964,9 +1148,15 @@ def _create_orchestrator_agent(state: SessionState) -> Agent:
 # State Management
 # -------------------------------------------------------------------------
 
-def _reset_all_state(state: SessionState) -> tuple[Phase, Agent]:
+def _reset_all_state(
+    state: SessionState,
+    engine: OrchestratorEngine | None = None,
+) -> tuple[Phase, Agent]:
     """Full reset: sample doc, planner session, and orchestrator agent."""
-    _reset_session_state(state)
+    if engine is not None:
+        engine.reset()
+    else:
+        _reset_session_state(state)
     clear_last_worker_context()
     clear_last_worker_run_state()
     reset_planner_agent()
@@ -984,6 +1174,7 @@ async def main():
     print(f"Initializing Orchestrator Agent with model: {MODEL_ID}...")
 
     state = SessionState()
+    engine = create_transport_agnostic_engine(state)
 
     try:
         agent = _create_orchestrator_agent(state)
@@ -1024,37 +1215,24 @@ async def main():
                 and not looks_like_new_request(user_input)
                 and not looks_like_cancel(user_input)
             ):
-                worker_state = get_last_worker_run_state()
-                recovery_context = (
-                    str(worker_state.get("context", "")).strip()
-                    if isinstance(worker_state, dict)
-                    else ""
-                )
-                if not recovery_context:
-                    print(
-                        "Orchestrator: Cannot resume worker execution because no checkpoint context is available. "
-                        "Run a full execution first.\n"
-                    )
-                    continue
-
                 if looks_like_worker_retry(user_input):
                     retry_reason = "explicit retry request"
                 else:
                     retry_reason = "auto-resume from failed phase"
 
-                retry_result = _run_worker_agent_with_state(
-                    state,
-                    f"{_RESUME_WORKER_MARKER}\n{recovery_context}",
-                )
+                retry_payload = await engine.retry_execution()
+                if "error" in retry_payload:
+                    print(f"Orchestrator: {retry_payload['error']}\n")
+                    continue
+
+                retry_result = str(retry_payload.get("execution_report", "")).strip()
                 print(f"Orchestrator: ({retry_reason}) {retry_result}\n")
                 check_and_clear_execution_flag()
-                latest_state = get_last_worker_run_state()
-                latest_status = str(latest_state.get("status", "")).lower()
-                phase = Phase.DONE if latest_status == "success" else Phase.EXEC_FAILED
+                phase = engine.phase
                 continue
 
             if looks_like_new_request(user_input):
-                phase, agent = _reset_all_state(state)
+                phase, agent = _reset_all_state(state, engine)
                 user_input = (
                     "The user started a new request. Ignore all previous context.\n"
                     f"New request: {user_input}\n"
@@ -1062,13 +1240,13 @@ async def main():
                 )
 
             elif looks_like_cancel(user_input) and phase != Phase.COLLECT_SAMPLE:
-                phase, agent = _reset_all_state(state)
+                phase, agent = _reset_all_state(state, engine)
                 print("Orchestrator: Request cancelled. Feel free to start a new request.\n")
                 continue
 
             elif phase == Phase.DONE:
                 # Any input after a completed flow starts a fresh cycle.
-                phase, agent = _reset_all_state(state)
+                phase, agent = _reset_all_state(state, engine)
                 user_input = (
                     "The previous workflow is not active. The user has a new request.\n"
                     f"New request: {user_input}\n"
@@ -1079,7 +1257,7 @@ async def main():
 
             if phase in (Phase.COLLECT_SAMPLE, Phase.GATHER_INFO):
                 if state.sample_doc_json is None:
-                    load_result = None
+                    load_payload: dict | None = None
                     source_label = None
                     source_detection_input = raw_user_input
                     normalized_input = source_detection_input.strip().lower()
@@ -1091,7 +1269,10 @@ async def main():
                     )
 
                     if pending_selected_index:
-                        load_result = submit_sample_doc_from_localhost_index(pending_selected_index)
+                        load_payload = engine.load_sample(
+                            source_type="localhost_index",
+                            source_value=pending_selected_index,
+                        )
                         source_label = "localhost OpenSearch index"
                         state.pending_localhost_index_options = []
                     elif (
@@ -1099,13 +1280,16 @@ async def main():
                         or option_3_selected
                     ):
                         index_hint = "" if option_3_selected else source_detection_input
-                        load_result = submit_sample_doc_from_localhost_index(index_hint)
+                        load_payload = engine.load_sample(
+                            source_type="localhost_index",
+                            source_value=index_hint,
+                        )
                         source_label = "localhost OpenSearch index"
                     elif _looks_like_pasted_sample_content(source_detection_input):
                         state.pending_localhost_index_options = []
-                        load_result = _orchestrator_submit_sample_doc(
-                            state,
-                            source_detection_input,
+                        load_payload = engine.load_sample(
+                            source_type="paste",
+                            source_value=source_detection_input,
                         )
                         source_label = "pasted sample content"
                     elif (
@@ -1113,15 +1297,21 @@ async def main():
                         or normalized_input in {"1", "option 1", "choice 1"}
                     ):
                         state.pending_localhost_index_options = []
-                        load_result = submit_sample_doc_from_local_file(BUILTIN_IMDB_SAMPLE_PATH)
+                        load_payload = engine.load_sample(source_type="builtin_imdb")
                         source_label = f"built-in IMDb sample file ({BUILTIN_IMDB_SAMPLE_PATH})"
                     elif looks_like_url_message(source_detection_input):
                         state.pending_localhost_index_options = []
-                        load_result = submit_sample_doc_from_url(source_detection_input)
+                        load_payload = engine.load_sample(
+                            source_type="url",
+                            source_value=source_detection_input,
+                        )
                         source_label = "URL"
                     elif looks_like_local_path_message(source_detection_input):
                         state.pending_localhost_index_options = []
-                        load_result = submit_sample_doc_from_local_file(source_detection_input)
+                        load_payload = engine.load_sample(
+                            source_type="local_file",
+                            source_value=source_detection_input,
+                        )
                         source_label = "local file/folder path"
                     elif option_4_selected:
                         state.pending_localhost_index_options = []
@@ -1136,64 +1326,33 @@ async def main():
                         )
                     elif normalized_input in {"2", "option 2", "choice 2"}:
                         state.pending_localhost_index_options = []
-                        load_result = (
-                            "Error: option 2 selected, but no local path or URL was provided. "
-                            f"Supported formats: {SUPPORTED_SAMPLE_FILE_FORMATS_COMMA}."
-                        )
+                        load_payload = {
+                            "error": (
+                                "Error: option 2 selected, but no local path or URL was provided. "
+                                f"Supported formats: {SUPPORTED_SAMPLE_FILE_FORMATS_COMMA}."
+                            )
+                        }
                         source_label = "path/URL option"
 
-                    loaded = load_result and _capture_sample_from_result(state, load_result)
-
-                    if loaded:
+                    if isinstance(load_payload, dict) and "error" not in load_payload:
                         state.pending_localhost_index_options = []
-                        parsed_result = json.loads(load_result)
-                        status_msg = parsed_result.get("status", "")
+                        status_msg = str(load_payload.get("status", "")).strip()
                         if status_msg:
                             print(f"Orchestrator: {status_msg}\n")
-                        sample_payload = parsed_result["sample_doc"]
+                        sample_payload = load_payload.get("sample_doc", {})
                         sample_json = json.dumps(sample_payload, ensure_ascii=False)
-                        state.inferred_semantic_text_fields = _infer_semantic_text_fields(sample_payload)
-                        state.inferred_text_search_required = bool(state.inferred_semantic_text_fields)
-                        source_is_localhost_index = bool(
-                            parsed_result.get("source_localhost_index")
-                        )
-                        if source_is_localhost_index:
-                            state.source_index_name = str(
-                                parsed_result.get("source_index_name", "")
-                            ).strip() or None
-                            raw_doc_count = parsed_result.get("source_index_doc_count")
-                            if isinstance(raw_doc_count, bool):
-                                state.source_index_doc_count = None
-                            elif isinstance(raw_doc_count, int):
-                                state.source_index_doc_count = max(0, raw_doc_count)
-                            else:
-                                state.source_index_doc_count = None
-                        else:
-                            state.source_index_name = None
-                            state.source_index_doc_count = None
+                        source_is_localhost_index = bool(load_payload.get("source_index_name"))
 
                         execution_policy_note = ""
                         if source_is_localhost_index:
-                            index_suffix = (
-                                f" '{state.source_index_name}'"
-                                if state.source_index_name
-                                else ""
-                            )
-                            execution_policy_note = (
-                                "Execution policy: source is localhost OpenSearch index"
-                                f"{index_suffix} (system-enforced, not user-stated); "
-                                "if target index already exists during setup, "
-                                "do NOT recreate it (replace_if_exists=false). "
-                                "Use a different target index name.\n"
-                            )
+                            policy_note = _build_localhost_execution_policy_note(state)
+                            if policy_note:
+                                execution_policy_note = f"{policy_note}\n"
                         doc_count_note = ""
-                        if source_is_localhost_index and isinstance(state.source_index_doc_count, int):
-                            doc_count_note = (
-                                "Requirements note: exact current document count already measured "
-                                f"from OpenSearch count API: {state.source_index_doc_count:,}. "
-                                "Do NOT ask current-count or growth-projection questions. "
-                                "Assume this is representative sample data and ingestion will continue.\n"
-                            )
+                        if source_is_localhost_index:
+                            localhost_count_note = _build_localhost_doc_count_note(state)
+                            if localhost_count_note:
+                                doc_count_note = f"{localhost_count_note}\n"
                         query_features_note = f"{_DEFAULT_QUERY_FEATURES_NOTE}\n"
                         text_search_use_case_note = (
                             f"{_build_text_search_use_case_note(state.inferred_text_search_required, state.inferred_semantic_text_fields)}\n"
@@ -1214,19 +1373,20 @@ async def main():
                             "[USER MESSAGE]\n"
                             f"{raw_user_input}"
                         )
-                    elif load_result and load_result.startswith("Error:"):
+                    elif isinstance(load_payload, dict) and str(load_payload.get("error", "")).startswith("Error:"):
+                        load_error = str(load_payload.get("error", ""))
                         source = source_label or "source"
                         localhost_empty_index_error = (
                             source_label == "localhost OpenSearch index"
-                            and "has no documents" in load_result.lower()
+                            and "has no documents" in load_error.lower()
                         )
                         localhost_index_selection_error = (
                             source_label == "localhost OpenSearch index"
                             and (
-                                "no index name was provided" in load_result.lower()
+                                "no index name was provided" in load_error.lower()
                                 or (
-                                    "was not found on local opensearch" in load_result.lower()
-                                    and "available non-system indices" in load_result.lower()
+                                    "was not found on local opensearch" in load_error.lower()
+                                    and "available non-system indices" in load_error.lower()
                                 )
                             )
                         )
@@ -1235,7 +1395,7 @@ async def main():
                             user_input = (
                                 f"{raw_user_input}\n\n"
                                 "System note: Automatic sample loading from localhost OpenSearch index failed.\n"
-                                f"Failure reason: {load_result}\n"
+                                f"Failure reason: {load_error}\n"
                                 "System instruction: The user already provided the index name. "
                                 "Do NOT ask for the index name again. "
                                 "Briefly explain that the index is empty, then ask the user to choose one of these: "
@@ -1247,12 +1407,12 @@ async def main():
                             )
                         elif localhost_index_selection_error:
                             state.pending_localhost_index_options = (
-                                _extract_localhost_index_options_from_error(load_result)
+                                _extract_localhost_index_options_from_error(load_error)
                             )
                             user_input = (
                                 f"{raw_user_input}\n\n"
                                 "System note: Automatic sample loading from localhost OpenSearch index failed.\n"
-                                f"Failure reason: {load_result}\n"
+                                f"Failure reason: {load_error}\n"
                                 "System instruction: Briefly tell the user this exact failure reason. "
                                 "If the failure reason includes an index list, present that list and ask the user "
                                 "to pick one index name from it for option 3 (they can reply with the list number "
@@ -1266,7 +1426,7 @@ async def main():
                             user_input = (
                                 f"{raw_user_input}\n\n"
                                 f"System note: Automatic sample loading from {source} failed.\n"
-                                f"Failure reason: {load_result}\n"
+                                f"Failure reason: {load_error}\n"
                                 "System instruction: Briefly tell the user this exact failure reason, "
                                 "then ask them to provide one of these: "
                                 "built-in IMDb sample (option 1), corrected path/URL (option 2), "
@@ -1350,30 +1510,39 @@ async def main():
                 if (
                     state.model_deployment_preference is None
                     and bool(state.inferred_text_search_required)
-                    and _is_semantic_dominant_query_pattern(state.hybrid_weight_profile)
+                    and _requires_model_deployment_preference(state.hybrid_weight_profile)
                 ):
                     state.model_deployment_preference = _read_model_deployment_preference_choice(
                         state.inferred_semantic_text_fields
                     )
+
+                hybrid_profile = str(state.hybrid_weight_profile or "").strip().lower()
+                if hybrid_profile == _HYBRID_WEIGHT_OPTION_LEXICAL:
+                    query_pattern = _QUERY_PATTERN_OPTION_MOSTLY_EXACT
+                elif hybrid_profile == _HYBRID_WEIGHT_OPTION_SEMANTIC:
+                    query_pattern = _QUERY_PATTERN_OPTION_MOSTLY_SEMANTIC
+                else:
+                    query_pattern = _QUERY_PATTERN_OPTION_BALANCED
+
+                engine.set_preferences(
+                    budget=str(state.budget_preference or _BUDGET_OPTION_FLEXIBLE),
+                    performance=str(state.performance_priority or _PERFORMANCE_OPTION_BALANCED),
+                    query_pattern=query_pattern,
+                    deployment_preference=str(state.model_deployment_preference or ""),
+                )
             if state.source_index_name:
                 extra_notes: list[str] = []
                 if "Execution policy: source is localhost OpenSearch index" not in user_input:
-                    extra_notes.append(
-                        "Execution policy: source is localhost OpenSearch index "
-                        f"'{state.source_index_name}' (system-enforced, not user-stated); "
-                        "if target index already exists during setup, "
-                        "do NOT recreate it (replace_if_exists=false). "
-                        "Use a different target index name."
-                    )
+                    localhost_policy_note = _build_localhost_execution_policy_note(state)
+                    if localhost_policy_note:
+                        extra_notes.append(localhost_policy_note)
                 if (
                     isinstance(state.source_index_doc_count, int)
                     and "Requirements note: exact current document count already measured from OpenSearch count API" not in user_input
                 ):
-                    extra_notes.append(
-                        "Requirements note: exact current document count already measured from OpenSearch count API: "
-                        f"{state.source_index_doc_count:,}. Do NOT ask current-count or growth-projection questions; "
-                        "assume this is representative sample data and ingestion will continue."
-                    )
+                    localhost_count_note = _build_localhost_doc_count_note(state)
+                    if localhost_count_note:
+                        extra_notes.append(localhost_count_note)
                 if extra_notes:
                     user_input = (
                         f"{user_input}\n\n"
@@ -1382,81 +1551,21 @@ async def main():
                     )
 
             if state.sample_doc_json is not None:
+                parsed_sample_doc: dict | None = None
                 if state.inferred_text_search_required is None:
                     try:
                         parsed_sample_doc = json.loads(state.sample_doc_json)
                     except (json.JSONDecodeError, TypeError):
                         parsed_sample_doc = None
-                    if parsed_sample_doc is not None:
-                        state.inferred_semantic_text_fields = _infer_semantic_text_fields(parsed_sample_doc)
-                        state.inferred_text_search_required = bool(state.inferred_semantic_text_fields)
+                if parsed_sample_doc is not None:
+                    state.inferred_semantic_text_fields = _infer_semantic_text_fields(parsed_sample_doc)
+                    state.inferred_text_search_required = bool(state.inferred_semantic_text_fields)
 
-                requirement_notes: list[str] = []
-                if _DEFAULT_QUERY_FEATURES_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_DEFAULT_QUERY_FEATURES_NOTE)
-                if _TEXT_SEARCH_USE_CASE_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(
-                        _build_text_search_use_case_note(
-                            state.inferred_text_search_required,
-                            state.inferred_semantic_text_fields,
-                        )
-                    )
-                if _MODEL_DEPLOYMENT_SCOPE_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_MODEL_DEPLOYMENT_SCOPE_NOTE)
-                if _PERFORMANCE_PRIORITY_SCOPE_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_PERFORMANCE_PRIORITY_SCOPE_NOTE)
-                if _SAMPLE_FINAL_TRUTH_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_SAMPLE_FINAL_TRUTH_NOTE)
-                if (
-                    state.inferred_text_search_required
-                    and _is_semantic_dominant_query_pattern(state.hybrid_weight_profile)
-                    and _NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE_PREFIX not in user_input
-                ):
-                    requirement_notes.append(_NATURAL_LANGUAGE_CONCEPT_SEARCH_NOTE)
-                if _SEMANTIC_EXPANSION_EXPLANATION_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_SEMANTIC_EXPANSION_EXPLANATION_NOTE)
-                if _MAPPING_CLARITY_FEEDBACK_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_MAPPING_CLARITY_FEEDBACK_NOTE)
-                if _DEFAULT_SPECIFIC_USE_CASES_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_DEFAULT_SPECIFIC_USE_CASES_NOTE)
-                if _DEFAULT_QUERY_SUPPORT_SCOPE_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_DEFAULT_QUERY_SUPPORT_SCOPE_NOTE)
-                if _DEFAULT_DASHBOARD_REQUIREMENT_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_DEFAULT_DASHBOARD_REQUIREMENT_NOTE)
-                if _DEFAULT_REALTIME_REQUIREMENT_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_DEFAULT_REALTIME_REQUIREMENT_NOTE)
-                if _DEFAULT_CUSTOM_REQUIREMENTS_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_DEFAULT_CUSTOM_REQUIREMENTS_NOTE)
-                if state.budget_preference and _BUDGET_PREFERENCE_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_build_budget_preference_note(state.budget_preference))
-                if state.performance_priority and _PERFORMANCE_PREFERENCE_NOTE_PREFIX not in user_input:
-                    requirement_notes.append(_build_performance_preference_note(state.performance_priority))
-                if (
-                    state.hybrid_weight_profile
-                    and _SEMANTIC_QUERY_PATTERN_PREFERENCE_NOTE_PREFIX not in user_input
-                ):
-                    requirement_notes.append(
-                        _build_semantic_query_pattern_preference_note(state.hybrid_weight_profile)
-                    )
-                if (
-                    state.prefix_wildcard_enabled is not None
-                    and _PREFIX_WILDCARD_REQUIREMENT_NOTE_PREFIX not in user_input
-                ):
-                    requirement_notes.append(
-                        _build_prefix_wildcard_requirement_note(state.prefix_wildcard_enabled)
-                    )
-                if (
-                    state.model_deployment_preference
-                    and _MODEL_DEPLOYMENT_PREFERENCE_NOTE_PREFIX not in user_input
-                ):
-                    requirement_notes.append(
-                        _build_model_deployment_preference_note(state.model_deployment_preference)
-                    )
-                if (
-                    state.hybrid_weight_profile
-                    and _HYBRID_WEIGHT_PROFILE_PREFIX not in user_input
-                ):
-                    requirement_notes.append(_build_hybrid_weight_profile_note(state.hybrid_weight_profile))
+                requirement_notes = [
+                    note
+                    for prefix, note in _iter_context_note_entries(state)
+                    if prefix not in user_input
+                ]
                 if requirement_notes:
                     user_input = (
                         f"{user_input}\n\n"

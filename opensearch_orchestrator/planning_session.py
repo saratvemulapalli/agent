@@ -6,7 +6,10 @@ terminal I/O.  Each call to ``start()``, ``send()``, or ``finalize()``
 performs one agent turn and returns the response immediately.
 """
 
+import inspect
 import re
+from collections.abc import Callable
+from typing import Any
 
 from opensearch_orchestrator.solution_planning_assistant import (
     _create_planner_agent,
@@ -22,7 +25,7 @@ from opensearch_orchestrator.solution_planning_assistant import (
     _build_capability_precheck_feedback,
     _looks_like_planner_confirmation,
 )
-from opensearch_orchestrator.scripts.opensearch_ops_tools import preview_capability_driven_verification
+from opensearch_orchestrator.scripts.opensearch_ops_tools import preview_cap_driven_verification
 from opensearch_orchestrator.scripts.shared import looks_like_new_request, looks_like_execution_intent
 
 
@@ -45,8 +48,9 @@ class PlanningSession:
         }
     """
 
-    def __init__(self) -> None:
-        self._agent = _create_planner_agent()
+    def __init__(self, agent: Callable[[str], Any] | None = None) -> None:
+        self._agent = agent or _create_planner_agent()
+        self._agent_factory = _create_planner_agent if agent is None else None
         self._initial_context: str = ""
         self._confirmation_received = False
         self._internal_retry_limit = 8
@@ -61,7 +65,42 @@ class PlanningSession:
     def start(self, context: str) -> dict:
         """Send initial context to the planner agent and return its first proposal."""
         self._initial_context = context
-        initial_input = (
+        return self._process_turn(self._build_initial_input(context))
+
+    async def astart(self, context: str) -> dict:
+        """Async variant of ``start`` for async-backed planner callables."""
+        self._initial_context = context
+        return await self._process_turn_async(self._build_initial_input(context))
+
+    def send(self, user_input: str) -> dict:
+        """Send user feedback and return the planner's next response."""
+        if self._result is not None:
+            return {"response": "", "is_complete": True, "result": self._result}
+
+        return self._process_turn(self._build_turn_input(user_input))
+
+    async def asend(self, user_input: str) -> dict:
+        """Async variant of ``send`` for async-backed planner callables."""
+        if self._result is not None:
+            return {"response": "", "is_complete": True, "result": self._result}
+        return await self._process_turn_async(self._build_turn_input(user_input))
+
+    def finalize(self) -> dict:
+        """Force the planner to finalize and return the structured result."""
+        if self._result is not None:
+            return {"response": "", "is_complete": True, "result": self._result}
+        self._confirmation_received = True
+        return self._process_turn(self._build_finalize_input())
+
+    async def afinalize(self) -> dict:
+        """Async variant of ``finalize`` for async-backed planner callables."""
+        if self._result is not None:
+            return {"response": "", "is_complete": True, "result": self._result}
+        self._confirmation_received = True
+        return await self._process_turn_async(self._build_finalize_input())
+
+    def _build_initial_input(self, context: str) -> str:
+        return (
             "Here is the user context:\n"
             f"{context}\n\n"
             "System note: confirmation behavior:\n"
@@ -72,44 +111,39 @@ class PlanningSession:
             "- Do not ask extra confirmation checklists.\n"
             "- Only finalize with <planning_complete> after clear proceed intent from the user."
         )
-        return self._process_turn(initial_input)
 
-    def send(self, user_input: str) -> dict:
-        """Send user feedback and return the planner's next response."""
-        if self._result is not None:
-            return {"response": "", "is_complete": True, "result": self._result}
+    def _build_finalize_input(self) -> str:
+        return (
+            "The user explicitly confirmed to proceed with setup/implementation.\n"
+            "Finalize now using <planning_complete>."
+        )
 
+    def _build_turn_input(self, user_input: str) -> str:
         if looks_like_new_request(user_input):
-            self._agent = _create_planner_agent()
+            self._reset_agent_for_new_request()
             self._confirmation_received = False
-            agent_input = (
+            return (
                 "The user started a new request. Ignore previous planning context "
                 "and treat this as a new conversation.\n"
                 f"New request: {user_input}\n"
                 "Please provide a technical recommendation."
             )
-        elif looks_like_execution_intent(user_input) or _looks_like_planner_confirmation(user_input):
+        if looks_like_execution_intent(user_input) or _looks_like_planner_confirmation(user_input):
             self._confirmation_received = True
-            agent_input = (
+            return (
                 "The user explicitly confirmed to proceed with setup/implementation.\n"
                 f"User message: {user_input}\n"
                 "Finalize now using <planning_complete>."
             )
-        else:
-            agent_input = user_input
+        return user_input
 
-        return self._process_turn(agent_input)
-
-    def finalize(self) -> dict:
-        """Force the planner to finalize and return the structured result."""
-        if self._result is not None:
-            return {"response": "", "is_complete": True, "result": self._result}
-        self._confirmation_received = True
-        agent_input = (
-            "The user explicitly confirmed to proceed with setup/implementation.\n"
-            "Finalize now using <planning_complete>."
-        )
-        return self._process_turn(agent_input)
+    def _reset_agent_for_new_request(self) -> None:
+        if self._agent_factory is not None:
+            self._agent = self._agent_factory()
+            return
+        reset_fn = getattr(self._agent, "reset", None)
+        if callable(reset_fn):
+            reset_fn()
 
     # ------------------------------------------------------------------
     # Internal
@@ -119,8 +153,7 @@ class PlanningSession:
         """Call the agent and process the response, retrying internally when needed."""
         current_input = agent_input
         for _ in range(self._internal_retry_limit):
-            response = self._agent(current_input)
-            response_text = str(response)
+            response_text = self._invoke_agent_sync(current_input)
 
             match = re.search(
                 r"<planning_complete>(.*?)</planning_complete>",
@@ -148,6 +181,54 @@ class PlanningSession:
             "is_complete": False,
             "result": None,
         }
+
+    async def _process_turn_async(self, agent_input: str) -> dict:
+        """Async turn processor that supports both sync and async planner callables."""
+        current_input = agent_input
+        for _ in range(self._internal_retry_limit):
+            response_text = await self._invoke_agent_async(current_input)
+
+            match = re.search(
+                r"<planning_complete>(.*?)</planning_complete>",
+                response_text,
+                re.DOTALL,
+            )
+            if match:
+                retry_input = self._try_extract_result(match)
+                if retry_input is not None:
+                    current_input = retry_input
+                    continue
+                return {
+                    "response": response_text,
+                    "is_complete": True,
+                    "result": self._result,
+                }
+
+            return {"response": response_text, "is_complete": False, "result": None}
+
+        return {
+            "response": (
+                "Planner internal retry limit reached while regenerating planning output. "
+                "Please continue with refine_plan(), or explicitly confirm and call finalize_plan()."
+            ),
+            "is_complete": False,
+            "result": None,
+        }
+
+    def _invoke_agent_sync(self, prompt: str) -> str:
+        response = self._agent(prompt)
+        if inspect.isawaitable(response):
+            raise RuntimeError(
+                "Async planner callable detected in sync PlanningSession path. "
+                "Use astart()/asend()/afinalize() for this planner backend."
+            )
+        return str(response)
+
+    async def _invoke_agent_async(self, prompt: str) -> str:
+        response = self._agent(prompt)
+        if inspect.isawaitable(response):
+            response = await response
+        return str(response)
 
     def _try_extract_result(self, match: re.Match) -> str | None:
         """Process a ``<planning_complete>`` match.
@@ -209,7 +290,7 @@ class PlanningSession:
             source_local_file = _extract_source_local_file(self._initial_context)
             source_index_name = _extract_localhost_source_index_name(self._initial_context)
             try:
-                preview_result = preview_capability_driven_verification(
+                preview_result = preview_cap_driven_verification(
                     worker_output=capability_block_for_precheck,
                     count=10,
                     sample_doc_json=sample_doc_json,
