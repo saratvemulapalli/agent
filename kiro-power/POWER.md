@@ -2,7 +2,7 @@
 name: "opensearch-search-builder"
 displayName: "Build a POC search application with OpenSearch"
 description: "Accelerate proof-of-concept search applications with guided, end-to-end architecture planning. Ingests sample documents, captures preferences, designs the solution architecture, and provisions indices, ML models, ingest pipelines, and a search UI."
-keywords: ["opensearch", "search", "semantic search", "vector search", "hybrid search", "RAG", "embeddings", "knn", "neural search", "BM25", "index", "search architecture", "docker", "local", "aws", "serverless", "aoss"]
+keywords: ["opensearch", "search", "semantic search", "vector search", "hybrid search", "RAG", "embeddings", "knn", "neural search", "BM25", "index", "search architecture", "Amazon OpenSearch", "aws", "serverless", "Amazon OpenSearch Serverless"]
 author: "AWS"
 ---
 
@@ -12,6 +12,105 @@ author: "AWS"
 
 1. **Python 3.10+** and `uv` installed ([Install uv](https://docs.astral.sh/uv/getting-started/installation/))
 2. **Docker** installed and running ([Download Docker](https://docs.docker.com/get-docker/))
+3. **For Phase 5 (AWS deployment)**: AWS credentials configured
+
+## AWS Setup (for Phase 5 deployment)
+
+Phase 5 (AWS deployment) is optional. Only complete this setup if you want to deploy to AWS OpenSearch.
+
+### Step 1: Add AWS MCP Servers
+
+Before starting Phase 5, add the required MCP servers to your power configuration:
+
+1. Open the power's `mcp.json` file (located in the power directory)
+2. Add the following servers to the `mcpServers` section:
+
+```json
+{
+  "mcpServers": {
+    "opensearch-orchestrator": {
+      "command": "uvx",
+      "args": ["opensearch-orchestrator@latest"],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "awslabs.aws-api-mcp-server": {
+      "command": "uvx",
+      "args": ["awslabs.aws-api-mcp-server@latest"],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": []
+    },
+    "opensearch-mcp-server": {
+      "command": "uvx",
+      "args": ["opensearch-mcp-server@latest"],
+      "env": {
+        "FASTMCP_LOG_LEVEL": "ERROR"
+      },
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}
+```
+
+3. Save the file and restart Kiro or reconnect the MCP servers
+
+### Step 2: Install AWS CLI
+
+Install AWS CLI if not already installed:
+
+```bash
+# macOS
+brew install awscli
+
+# Linux
+pip install awscli
+
+# Windows
+# Download from https://aws.amazon.com/cli/
+```
+
+### Step 3: Configure AWS Credentials
+
+Choose one method:
+
+**Option A: AWS CLI configuration** (recommended):
+```bash
+aws configure
+# Enter your AWS Access Key ID
+# Enter your AWS Secret Access Key
+# Enter your default region (e.g., us-east-1)
+# Enter default output format (json)
+```
+
+**Option B: Environment variables**:
+```bash
+export AWS_ACCESS_KEY_ID="your-access-key"
+export AWS_SECRET_ACCESS_KEY="your-secret-key"
+export AWS_REGION="us-east-1"
+```
+
+### Step 4: Verify Setup
+
+Verify AWS credentials:
+```bash
+aws sts get-caller-identity
+```
+
+### Step 5: Ensure IAM Permissions
+
+Your AWS user/role needs permissions for:
+- OpenSearch Service: Create/manage domains and serverless collections
+- IAM: Create and manage roles for OpenSearch
+- Bedrock: Invoke models (for semantic search and agentic search)
+
+Once configured, the AWS MCP servers will be available for Phase 5 deployment.
 
 ## Quick Test
 
@@ -79,10 +178,17 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 
 ### Phase 5: Deploy to AWS OpenSearch (optional)
 - After successful local execution, offer to deploy the search strategy to AWS OpenSearch.
-- Use AWS MCP tools (from the aws-api-mcp-server) to provision OpenSearch Serverless or managed OpenSearch Service.
-- Follow the AWS deployment steering file for detailed provisioning steps.
+- **Important**: Before starting Phase 5, guide the user to add AWS MCP servers to the power's mcp.json configuration (see AWS Setup in Onboarding section). Verify the servers are configured before proceeding.
+- Choose deployment target based on search strategy:
+  - **OpenSearch Serverless (AOSS)**: For Neural Sparse, Dense Vector, BM25, and Hybrid search
+  - **OpenSearch Domain (AOS)**: Required for Agentic Search; also supports all other strategies
+- Use AWS API MCP tools (from the aws-api-mcp-server) to provision resources.
+- Use OpenSearch MCP tools (from opensearch-mcp-server) to interact with the deployed cluster.
+- Follow the appropriate AWS deployment steering file:
+  - `aws-opensearch-serverless.md` for AOSS deployment
+  - `aws-opensearch-domain.md` for AOS deployment (Agentic Search)
 - Migrate the local configuration (indices, models, pipelines) to AWS.
-- Configure AWS-specific settings (VPC, security, IAM roles, etc.).
+- Configure AWS-specific settings (IAM roles, security, network access).
 - Provide the user with AWS endpoint URLs and access instructions.
 
 ### Post-Execution
@@ -135,4 +241,6 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - Phase 5 (AWS deployment) is optional and should only be offered after successful Phase 4 execution.
 
 ## Prerequisites
-- See the [Onboarding](#onboarding) section at the top of this document.
+- Python 3.10+, uv, and Docker are required for Phases 1-4 (local development)
+- AWS credentials and MCP servers are required for Phase 5 (AWS deployment) - see AWS Setup section
+- See the [Onboarding](#onboarding) section for detailed setup instructions
