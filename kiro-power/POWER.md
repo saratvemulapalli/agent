@@ -2,7 +2,7 @@
 name: "opensearch-search-builder"
 displayName: "Build a POC search application with OpenSearch"
 description: "Accelerate proof-of-concept search applications with guided, end-to-end architecture planning. Ingests sample documents, captures preferences, designs the solution architecture, and provisions indices, ML models, ingest pipelines, and a search UI."
-keywords: ["opensearch", "search", "semantic search", "vector search", "hybrid search", "RAG", "embeddings", "knn", "neural search", "BM25", "index", "search architecture"]
+keywords: ["opensearch", "search", "semantic search", "vector search", "hybrid search", "RAG", "embeddings", "knn", "neural search", "BM25", "index", "search architecture", "docker", "local", "aws", "serverless", "aoss"]
 author: "AWS"
 ---
 
@@ -70,15 +70,25 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - When the user confirms:
   - tool-driven path: call `finalize_plan()` and use {solution, search_capabilities, keynote}
   - manual path: call `set_plan_from_planning_complete(planner_response)` with the finalized planner output
+- After plan finalization, write a manifest file to the customer's local directory documenting the recommended search strategy, including architecture decisions, model choices, index configuration, and pipeline setup.
 
 ### Phase 4: Execute
 - Call `execute_plan()` to create the index, models, pipelines, and launch the UI.
 - If execution fails, the user can fix the issue (e.g., restart Docker) and you
   call `retry_execution()`.
 
+### Phase 5: Deploy to AWS OpenSearch (optional)
+- After successful local execution, offer to deploy the search strategy to AWS OpenSearch.
+- Use AWS MCP tools (from the aws-api-mcp-server) to provision OpenSearch Serverless or managed OpenSearch Service.
+- Follow the AWS deployment steering file for detailed provisioning steps.
+- Migrate the local configuration (indices, models, pipelines) to AWS.
+- Configure AWS-specific settings (VPC, security, IAM roles, etc.).
+- Provide the user with AWS endpoint URLs and access instructions.
+
 ### Post-Execution
 - After successful `execute_plan()`/`retry_execution()`, explicitly tell the user
   how to access the UI using the `ui_access` URLs returned by the tool result.
+- After Phase 5 AWS deployment, provide AWS endpoint URLs and configuration details.
 - `cleanup_verification()` removes test documents when the user explicitly asks.
 
 ## Available Tools
@@ -122,6 +132,7 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - Show the planner's proposal text to the user verbatim; do not summarize it away.
 - For preference questions, present numbered lists. Accept either a number or a free-text answer.
 - Do not ask redundant clarification questions for items already inferred from the sample data.
+- Phase 5 (AWS deployment) is optional and should only be offered after successful Phase 4 execution.
 
 ## Prerequisites
 - See the [Onboarding](#onboarding) section at the top of this document.
