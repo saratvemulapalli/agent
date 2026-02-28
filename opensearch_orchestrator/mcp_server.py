@@ -22,7 +22,9 @@ if __package__ in {None, ""}:
 
 import errno
 from contextlib import contextmanager
+import json
 import os
+from pathlib import Path
 import re
 import sys
 from typing import Any
@@ -30,6 +32,11 @@ from typing import Any
 import anyio
 from mcp import types as mcp_types
 from mcp.server.fastmcp import Context, FastMCP
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None
 
 from opensearch_orchestrator.orchestrator import create_transport_agnostic_engine
 from opensearch_orchestrator.planning_session import PlanningSession
@@ -126,28 +133,19 @@ Use the opensearch-orchestrator MCP tools to guide the user from requirements to
 
 ### Phase 3: Plan
 - Call `start_planning()` to get an initial architecture proposal from the client LLM planner.
-- If `start_planning()` returns `manual_planning_required=true`, use the client LLM to draft
-  planner turns using the returned `manual_planner_system_prompt` and
-  `manual_planner_initial_input`, then call `set_plan_from_planning_complete(...)`
-  once the user confirms.
+- If `start_planning()` returns `manual_planning_required=true`, follow the returned planner bootstrap payload and call `set_plan_from_planning_complete(...)` once the user confirms.
 - Otherwise, present the proposal to the user verbatim (do not summarize it away).
 - If the user has feedback or questions, call `refine_plan(user_feedback)`. Repeat as needed.
 - When the user confirms, call `finalize_plan()`.
   This returns {solution, search_capabilities, keynote}.
 
 ### Phase 4: Execute
-- Call `execute_plan()` to get manual worker bootstrap payload.
-- Run worker turns with the client LLM using:
-  - system message: `worker_system_prompt`
-  - first user message: `worker_initial_input`
-- Allow the client LLM to call execution tools (`create_index`, `create_and_attach_pipeline`,
-  `create_bedrock_embedding_model`, `create_local_pretrained_model`,
-  `apply_capability_driven_verification`, `launch_search_ui`, `set_search_ui_suggestions`) until done.
-- Commit the final worker response via `set_execution_from_execution_report(worker_response, execution_context)`.
-- If execution fails, the user can fix the issue (e.g., restart Docker) and call `retry_execution()` for a resume bootstrap payload.
+- Call `execute_plan()` to run index/model/pipeline/UI setup.
+- If `execute_plan()` returns manual execution bootstrap payload, follow it and then commit the final worker response via `set_execution_from_execution_report(worker_response, execution_context)`.
+- If execution fails, the user can fix the issue (e.g., restart Docker) and call `retry_execution()`.
 
 ### Post-Execution
-- After successful `set_execution_from_execution_report(...)`, explicitly tell the user
+- After successful execution completion, explicitly tell the user
   how to access the UI using the returned `ui_access` URLs.
 - `cleanup()` removes test/verification documents when the user explicitly asks.
 
@@ -157,7 +155,7 @@ Use the opensearch-orchestrator MCP tools to guide the user from requirements to
 - If manual planning is required (`sampling/createMessage` unavailable), generate the plan with the
   client LLM using the provided planner prompt/input and persist it with
   `set_plan_from_planning_complete(...)` before execution.
-- Use `talk_to_client_llm(...)` as the general client-LLM bridge tool when direct sampling orchestration is needed.
+- When a tool returns manual bootstrap payload fields, follow that payload instead of inventing alternate orchestration steps.
 - Show the planner's proposal text to the user verbatim; do not summarize it away.
 - For preference questions, ask one question per turn and use user-input UI fixed options, not free-text.
 - Do not ask redundant clarification questions for items already inferred from the sample data.
@@ -214,6 +212,189 @@ _VALID_LOCALHOST_AUTH_MODES = {
     _LOCALHOST_AUTH_MODE_NONE,
     _LOCALHOST_AUTH_MODE_CUSTOM,
 }
+_MCP_STATE_PERSIST_ENV = "OPENSEARCH_MCP_PERSIST_STATE"
+_MCP_STATE_FILE_ENV = "OPENSEARCH_MCP_STATE_FILE"
+_DEFAULT_MCP_STATE_FILE = (
+    Path.home() / ".opensearch_orchestrator" / "mcp_state.json"
+)
+_MCP_STATE_VERSION = 1
+_PERSISTED_STATE_FIELDS = (
+    "sample_doc_json",
+    "source_local_file",
+    "source_index_name",
+    "source_index_doc_count",
+    "inferred_text_search_required",
+    "inferred_semantic_text_fields",
+    "budget_preference",
+    "performance_priority",
+    "model_deployment_preference",
+    "prefix_wildcard_enabled",
+    "hybrid_weight_profile",
+    "pending_localhost_index_options",
+    "localhost_auth_mode",
+    "localhost_auth_username",
+)
+
+
+def _mcp_state_persistence_enabled() -> bool:
+    raw = str(os.getenv(_MCP_STATE_PERSIST_ENV, "1") or "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _resolve_mcp_state_file_path() -> Path:
+    configured = str(os.getenv(_MCP_STATE_FILE_ENV, "") or "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return _DEFAULT_MCP_STATE_FILE
+
+
+@contextmanager
+def _mcp_state_file_lock(path: Path):
+    """Best-effort cross-process lock for persisted MCP state operations."""
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_fd: int | None = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        if lock_fd is None:
+            return
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        try:
+            os.close(lock_fd)
+        except Exception:
+            pass
+
+
+def _read_persisted_engine_payload() -> dict[str, object]:
+    if not _mcp_state_persistence_enabled():
+        return {}
+
+    path = _resolve_mcp_state_file_path()
+    if not path.exists():
+        return {}
+
+    try:
+        with _mcp_state_file_lock(path):
+            payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(
+            f"[mcp_server.state] Failed to read persisted state '{path}': {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return {}
+
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _read_persisted_state_snapshot() -> dict[str, object]:
+    payload = _read_persisted_engine_payload()
+    state_payload = payload.get("state", {})
+    if isinstance(state_payload, dict):
+        return state_payload
+    return {}
+
+
+def _build_persistable_engine_payload() -> dict[str, object]:
+    state_payload: dict[str, object] = {}
+    state = getattr(_engine, "state", None)
+    if state is not None:
+        for field_name in _PERSISTED_STATE_FIELDS:
+            if not hasattr(state, field_name):
+                continue
+            value = getattr(state, field_name, None)
+            if isinstance(value, tuple):
+                value = list(value)
+            state_payload[field_name] = value
+
+    phase_obj = getattr(_engine, "phase", None)
+    phase_name = str(getattr(phase_obj, "name", "") or "").strip()
+    plan_result = getattr(_engine, "plan_result", None)
+    normalized_plan_result = (
+        dict(plan_result)
+        if isinstance(plan_result, dict)
+        else None
+    )
+    return {
+        "version": _MCP_STATE_VERSION,
+        "phase": phase_name,
+        "state": state_payload,
+        "plan_result": normalized_plan_result,
+    }
+
+
+def _persist_engine_state(reason: str = "", *, recreate: bool = False) -> None:
+    if not _mcp_state_persistence_enabled():
+        return
+
+    path = _resolve_mcp_state_file_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _mcp_state_file_lock(path):
+            if recreate:
+                try:
+                    path.unlink(missing_ok=True)
+                except TypeError:
+                    if path.exists():
+                        path.unlink()
+            payload = _build_persistable_engine_payload()
+            temp_path = path.with_suffix(path.suffix + ".tmp")
+            temp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temp_path.replace(path)
+    except Exception as exc:
+        detail = f" ({reason})" if reason else ""
+        print(
+            f"[mcp_server.state] Failed to persist state{detail}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _restore_engine_state_from_file() -> None:
+    if not _mcp_state_persistence_enabled():
+        return
+
+    payload = _read_persisted_engine_payload()
+    if not isinstance(payload, dict):
+        return
+
+    state_payload = payload.get("state", {})
+    state = getattr(_engine, "state", None)
+    if isinstance(state_payload, dict) and state is not None:
+        for field_name in _PERSISTED_STATE_FIELDS:
+            if field_name not in state_payload:
+                continue
+            try:
+                setattr(state, field_name, state_payload[field_name])
+            except Exception:
+                continue
+
+    phase_name = str(payload.get("phase", "") or "").strip()
+    if phase_name:
+        try:
+            _engine.phase = Phase[phase_name]
+        except Exception:
+            pass
+
+    plan_result = payload.get("plan_result")
+    if isinstance(plan_result, dict):
+        try:
+            _engine.plan_result = dict(plan_result)
+        except Exception:
+            pass
 
 
 def _resolve_planner_mode() -> str:
@@ -233,29 +414,109 @@ def _is_method_not_found_error(exc: Exception) -> bool:
     return "method not found" in message
 
 
+_restore_engine_state_from_file()
+
+
 def _resolve_execution_auth_override_from_state() -> tuple[str, str, str] | None:
     """Return localhost auth override from engine state for localhost-index sessions."""
+    persisted_state = _read_persisted_state_snapshot()
+    persisted_source_index_name = str(
+        persisted_state.get("source_index_name", "") or ""
+    ).strip()
+    persisted_mode = str(
+        persisted_state.get("localhost_auth_mode", _LOCALHOST_AUTH_MODE_DEFAULT) or ""
+    ).strip().lower()
+    persisted_username = str(
+        persisted_state.get("localhost_auth_username", "") or ""
+    ).strip()
+
     state = getattr(_engine, "state", None)
     if state is None:
-        return None
+        if not persisted_source_index_name:
+            return None
+        if persisted_mode not in _VALID_LOCALHOST_AUTH_MODES:
+            persisted_mode = _LOCALHOST_AUTH_MODE_DEFAULT
+        if persisted_mode == _LOCALHOST_AUTH_MODE_CUSTOM and persisted_username:
+            # Password is intentionally not persisted; cannot override custom auth on restart.
+            return None
+        return persisted_mode, "", ""
 
     source_index_name = str(getattr(state, "source_index_name", "") or "").strip()
+    if not source_index_name:
+        source_index_name = persisted_source_index_name
     if not source_index_name:
         return None
 
     mode = str(
         getattr(state, "localhost_auth_mode", _LOCALHOST_AUTH_MODE_DEFAULT) or ""
     ).strip().lower()
+    if not mode:
+        mode = persisted_mode
     if mode not in _VALID_LOCALHOST_AUTH_MODES:
         mode = _LOCALHOST_AUTH_MODE_DEFAULT
 
     if mode == _LOCALHOST_AUTH_MODE_CUSTOM:
         username = str(getattr(state, "localhost_auth_username", "") or "").strip()
         password = str(getattr(state, "localhost_auth_password", "") or "").strip()
+        if not username:
+            username = persisted_username
         if not username or not password:
             return None
         return mode, username, password
     return mode, "", ""
+
+
+def _resolve_sample_source_defaults(
+    *,
+    sample_doc_json: str = "",
+    source_local_file: str = "",
+    source_index_name: str = "",
+) -> tuple[str, str, str]:
+    """Resolve sample-source arguments, preferring explicit args then persisted state."""
+    resolved_sample_doc_json = str(sample_doc_json or "").strip()
+    resolved_source_local_file = str(source_local_file or "").strip()
+    resolved_source_index_name = str(source_index_name or "").strip()
+
+    persisted_state = _read_persisted_state_snapshot()
+    if not resolved_sample_doc_json:
+        resolved_sample_doc_json = str(
+            persisted_state.get("sample_doc_json", "") or ""
+        ).strip()
+    if not resolved_source_local_file:
+        resolved_source_local_file = str(
+            persisted_state.get("source_local_file", "") or ""
+        ).strip()
+    if not resolved_source_index_name:
+        resolved_source_index_name = str(
+            persisted_state.get("source_index_name", "") or ""
+        ).strip()
+
+    state = getattr(_engine, "state", None)
+    if state is None:
+        return (
+            resolved_sample_doc_json,
+            resolved_source_local_file,
+            resolved_source_index_name,
+        )
+
+    # Compatibility fallback for cases where file persistence is disabled or unavailable.
+    if not resolved_sample_doc_json:
+        resolved_sample_doc_json = str(
+            getattr(state, "sample_doc_json", "") or ""
+        ).strip()
+    if not resolved_source_local_file:
+        resolved_source_local_file = str(
+            getattr(state, "source_local_file", "") or ""
+        ).strip()
+    if not resolved_source_index_name:
+        resolved_source_index_name = str(
+            getattr(state, "source_index_name", "") or ""
+        ).strip()
+    return (
+        resolved_sample_doc_json,
+        resolved_source_local_file,
+        resolved_source_index_name,
+    )
 
 
 @contextmanager
@@ -546,6 +807,22 @@ def _build_manual_llm_payload(
 
 
 def _build_worker_bootstrap_payload(execution_context: str) -> dict[str, object]:
+    """Build bootstrap prompts for manual client-LLM execution fallback.
+
+    MCP client-mode usage flow:
+    1. Call `load_sample(...)` (include localhost auth args when source_type is localhost_index),
+       then `set_preferences(...)`, then `start_planning()`.
+    2. If `start_planning()` returns `manual_planning_required=true`, run planner turns
+       in the client LLM using:
+       - system message: `manual_planner_system_prompt`
+       - first user message: `manual_planner_initial_input`
+       - follow-up user feedback turns until the user confirms the plan
+    3. Commit the confirmed plan via
+       `set_plan_from_planning_complete(planner_response)`, where
+       `planner_response` includes:
+       `<planning_complete><solution>...</solution><search_capabilities>...</search_capabilities><keynote>...</keynote></planning_complete>`
+    4. Continue with `execute_plan()` (and `retry_execution()` if needed).
+    """
     worker_context = str(execution_context or "").strip()
     return {
         "manual_execution_required": True,
@@ -681,13 +958,16 @@ def load_sample(
         dict with sample_doc, inferred_text_fields, text_search_required,
         and status message.
     """
-    return _engine.load_sample(
+    result = _engine.load_sample(
         source_type=source_type,
         source_value=source_value,
         localhost_auth_mode=localhost_auth_mode,
         localhost_auth_username=localhost_auth_username,
         localhost_auth_password=localhost_auth_password,
     )
+    # Entering step 1 starts a fresh persisted conversation snapshot.
+    _persist_engine_state("load_sample", recreate=True)
+    return result
 
 
 @mcp.tool()
@@ -711,12 +991,14 @@ def set_preferences(
     Returns:
         dict confirming stored preferences and generated context notes.
     """
-    return _engine.set_preferences(
+    result = _engine.set_preferences(
         budget=budget,
         performance=performance,
         query_pattern=query_pattern,
         deployment_preference=deployment_preference,
     )
+    _persist_engine_state("set_preferences")
+    return result
 
 
 @mcp.tool()
@@ -791,6 +1073,7 @@ async def start_planning(additional_context: str = "", ctx: Context | None = Non
             planning_agent=_ClientSamplingPlannerAgent(ctx),
         )
         result["planner_backend"] = "client_sampling"
+        _persist_engine_state("start_planning")
         return result
     except Exception as exc:
         if _is_method_not_found_error(exc):
@@ -825,7 +1108,9 @@ async def refine_plan(user_feedback: str) -> dict:
     Returns:
         dict with response text, is_complete flag, and result (if complete).
     """
-    return await _engine.refine_plan(user_feedback)
+    result = await _engine.refine_plan(user_feedback)
+    _persist_engine_state("refine_plan")
+    return result
 
 
 @mcp.tool()
@@ -836,7 +1121,9 @@ async def finalize_plan() -> dict:
     Returns:
         dict with solution, search_capabilities, and keynote.
     """
-    return await _engine.finalize_plan()
+    result = await _engine.finalize_plan()
+    _persist_engine_state("finalize_plan")
+    return result
 
 
 def set_plan(solution: str, search_capabilities: str = "", keynote: str = "") -> dict:
@@ -859,11 +1146,13 @@ def set_plan(solution: str, search_capabilities: str = "", keynote: str = "") ->
     )
     if "error" in normalized:
         return normalized
-    return _engine.set_plan(
+    result = _engine.set_plan(
         solution=str(normalized.get("solution", "")),
         search_capabilities=str(normalized.get("search_capabilities", "")),
         keynote=str(normalized.get("keynote", "")),
     )
+    _persist_engine_state("set_plan")
+    return result
 
 
 @mcp.tool()
@@ -889,11 +1178,13 @@ def set_plan_from_planning_complete(planner_response: str, additional_context: s
     )
     if "error" in normalized:
         return normalized
-    return _engine.set_plan(
+    result = _engine.set_plan(
         solution=str(normalized.get("solution", "")),
         search_capabilities=str(normalized.get("search_capabilities", "")),
         keynote=str(normalized.get("keynote", "")),
     )
+    _persist_engine_state("set_plan_from_planning_complete")
+    return result
 
 
 @mcp.tool()
@@ -967,6 +1258,7 @@ def set_execution_from_execution_report(
     report = committed.get("execution_report", {})
     status = str(report.get("status", "")).strip().lower() if isinstance(report, dict) else ""
     _engine.phase = Phase.DONE if status == "success" else Phase.EXEC_FAILED
+    _persist_engine_state("set_execution_from_execution_report")
     return {
         "status": str(committed.get("status", "Execution report stored.")),
         "execution_report": report,
@@ -985,33 +1277,53 @@ def create_index(
     source_index_name: str = "",
 ) -> str:
     """Create an OpenSearch index for MCP manual execution mode."""
+    (
+        resolved_sample_doc_json,
+        resolved_source_local_file,
+        resolved_source_index_name,
+    ) = _resolve_sample_source_defaults(
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+    )
     with _temporary_execution_auth_env():
         return create_index_impl(
             index_name=index_name,
             body=body,
             replace_if_exists=replace_if_exists,
-            sample_doc_json=sample_doc_json,
-            source_local_file=source_local_file,
-            source_index_name=source_index_name,
+            sample_doc_json=resolved_sample_doc_json,
+            source_local_file=resolved_source_local_file,
+            source_index_name=resolved_source_index_name,
         )
 
 
 @mcp.tool()
 def create_and_attach_pipeline(
     pipeline_name: str,
-    pipeline_body: dict,
-    index_name: str,
+    pipeline_body: dict | None = None,
+    index_name: str = "",
     pipeline_type: str = "ingest",
     replace_if_exists: bool = True,
     is_hybrid_search: bool = False,
     hybrid_weights: list[float] | None = None,
+    body: dict | None = None,
 ) -> str:
     """Create and attach ingest/search pipelines for MCP manual execution mode."""
+    resolved_pipeline_body = pipeline_body if pipeline_body is not None else body
+    if resolved_pipeline_body is None:
+        resolved_pipeline_body = {}
+    if not isinstance(resolved_pipeline_body, dict):
+        return "Error: pipeline_body must be a JSON object."
+
+    resolved_index_name = str(index_name or "").strip()
+    if not resolved_index_name:
+        return "Error: index_name is required."
+
     with _temporary_execution_auth_env():
         return create_and_attach_pipeline_impl(
             pipeline_name=pipeline_name,
-            pipeline_body=pipeline_body,
-            index_name=index_name,
+            pipeline_body=resolved_pipeline_body,
+            index_name=resolved_index_name,
             pipeline_type=pipeline_type,
             replace_if_exists=replace_if_exists,
             is_hybrid_search=is_hybrid_search,
@@ -1046,17 +1358,27 @@ async def apply_capability_driven_verification(
     ctx: Context | None = None,
 ) -> dict[str, object]:
     """Apply capability-driven verification and MCP semantic-query rewrite via client LLM."""
+    (
+        resolved_sample_doc_json,
+        resolved_source_local_file,
+        resolved_source_index_name,
+    ) = _resolve_sample_source_defaults(
+        sample_doc_json=sample_doc_json,
+        source_local_file=source_local_file,
+        source_index_name=source_index_name,
+    )
     with _temporary_execution_auth_env():
         result = apply_capability_driven_verification_impl(
             worker_output=worker_output,
             index_name=index_name,
             count=count,
             id_prefix=id_prefix,
-            sample_doc_json=sample_doc_json,
-            source_local_file=source_local_file,
-            source_index_name=source_index_name,
+            sample_doc_json=resolved_sample_doc_json,
+            source_local_file=resolved_source_local_file,
+            source_index_name=resolved_source_index_name,
             existing_verification_doc_ids=existing_verification_doc_ids,
         )
+    # write semantic query
     return await _rewrite_semantic_suggestion_entries_with_client_llm(result=result, ctx=ctx)
 
 
