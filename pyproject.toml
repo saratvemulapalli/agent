@@ -37,7 +37,6 @@ cli = [
 [dependency-groups]
 dev = [
     "pytest",
-    "pytest-asyncio",
 ]
 
 [project.urls]
