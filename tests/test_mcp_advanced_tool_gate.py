@@ -35,7 +35,6 @@ def test_default_tool_surface_is_workflow_only() -> None:
         "create_bedrock_embedding_model",
         "create_index",
         "create_local_pretrained_model",
-        "disconnect_search_ui_from_endpoint",
         "execute_plan",
         "finalize_plan",
         "launch_search_ui",

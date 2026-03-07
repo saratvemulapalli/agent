@@ -77,7 +77,6 @@ from opensearch_orchestrator.opensearch_ops_tools import (
     cleanup_ui_server as cleanup_ui_server_impl,
     set_search_ui_suggestions as set_search_ui_suggestions_impl,
     connect_search_ui_to_endpoint as connect_search_ui_to_endpoint_impl,
-    disconnect_search_ui_from_endpoint as disconnect_search_ui_from_endpoint_impl,
     RUNTIME_MODE_ENV,
     RUNTIME_MODE_MCP,
 )
@@ -1514,13 +1513,6 @@ def connect_search_ui_to_endpoint(
         index_name=index_name,
     )
 
-
-@mcp.tool()
-def disconnect_search_ui_from_endpoint() -> str:
-    """Reset the Search UI back to the default local OpenSearch endpoint.
-    Use this to switch back from an AWS endpoint to local development.
-    """
-    return disconnect_search_ui_from_endpoint_impl()
 
 
 @mcp.tool()

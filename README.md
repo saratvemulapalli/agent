@@ -117,6 +117,7 @@ The server exposes high-level phase tools:
 | `set_execution_from_execution_report` | 4 | Parse/store `<execution_report>` and update retry state |
 | `retry_execution` | 4 | Return resume bootstrap payload from last failed step |
 | `prepare_aws_deployment` | 5 | Return deployment target and steering files for AWS |
+| `connect_search_ui_to_endpoint` | 5 | Switch Search UI to query an AWS OpenSearch endpoint after deployment |
 | `cleanup` | Post | Remove test documents on user request |
 
 The following execution/knowledge tools are also exposed:

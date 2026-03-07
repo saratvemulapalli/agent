@@ -5800,21 +5800,6 @@ def connect_search_ui_to_endpoint(
     return "\n".join(lines)
 
 
-def disconnect_search_ui_from_endpoint() -> str:
-    """Reset the Search UI back to the default local OpenSearch endpoint."""
-    _search_ui.endpoint_override_host = ""
-    _search_ui.endpoint_override_port = 0
-    _search_ui.endpoint_override_auth = None
-    _search_ui.endpoint_override_aws_region = ""
-    _search_ui.endpoint_override_aws_service = ""
-    _write_ui_state()
-    backend = _get_backend_info()
-    return (
-        f"Search UI reset to local endpoint: {backend['endpoint']}\n"
-        f"Connected: {backend['connected']}\n"
-        "Refresh the Search UI in your browser to see the updated connection badge."
-    )
-
 
 def cleanup_ui_server() -> str:
     """Stop the standalone Search Builder UI server if ownership checks pass."""

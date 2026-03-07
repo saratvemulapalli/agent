@@ -289,7 +289,6 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 - `cleanup()` removes test documents when the user explicitly asks.
 - After Phase 5 AWS deployment, provide AWS endpoint URLs and configuration details.
 - After Phase 5, call `connect_search_ui_to_endpoint(endpoint, port, use_ssl, username, password, index_name)` to switch the Search UI to the AWS endpoint so the user can test searches against the cloud deployment directly from the same UI. The UI header badge will update to show "AWS Cloud" with a green connection dot.
-- To switch back to local, call `disconnect_search_ui_from_endpoint()`.
 
 ## Available Tools
 
@@ -307,7 +306,6 @@ This power provides an OpenSearch Search Solution building workflow. It collects
 | `retry_execution` | 4 | Resume from a failed execution step |
 | `prepare_aws_deployment` | 5 | Get deployment target, local config, steering file list, and state template for AWS deployment |
 | `connect_search_ui_to_endpoint` | 5 | Switch Search UI to query an AWS OpenSearch endpoint after deployment |
-| `disconnect_search_ui_from_endpoint` | Post | Reset Search UI back to local OpenSearch endpoint |
 | `cleanup` | Post | Remove test documents on user request |
 
 ### Knowledge Tools
