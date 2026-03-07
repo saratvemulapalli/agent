@@ -9,4 +9,5 @@ This document contains a list of maintainers in this repo. See [opensearch-proje
 | Kaituo Li             | [kaituo](https://github.com/kaituo)                           | Amazon      |
 | Fen Qin               | [fen-qin](https://github.com/fen-qin)                         | Amazon      |
 | Sarat Vemulapalli     | [saratvemulapalli](https://github.com/saratvemulapalli)       | Amazon      |
+| Owais Kazi            | [owaiskazi19](https://github.com/owaiskazi19)                 | Amazon      |
 
