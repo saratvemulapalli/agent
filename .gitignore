@@ -222,3 +222,6 @@ local/
 
 # Kiro local settings
 .kiro/
+
+# MCP config (may contain credentials)
+.mcp.json
