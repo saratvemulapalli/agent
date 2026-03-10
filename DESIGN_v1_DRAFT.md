@@ -483,9 +483,9 @@ added complexity.
 
 ### Why 500 lines as the limit?
 
-- Claude Code recommends < 200 lines for CLAUDE.md files
-- Cursor recommends < 500 lines for rules files
-- Agent Skills spec recommends < 500 lines for SKILL.md
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code/memory#claudemd-files) recommends < 200 lines for CLAUDE.md files
+- [Cursor](https://docs.cursor.com/context/rules) recommends < 500 lines for rules files
+- [Agent Skills spec](https://agentskills.io/specification) recommends < 500 lines for SKILL.md
 - Kiro has no published limit, but the same principles apply
 
 500 lines is the common upper bound. In practice, the primary instruction file
