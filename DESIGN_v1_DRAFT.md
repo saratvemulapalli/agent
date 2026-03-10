@@ -456,6 +456,31 @@ via Powers (`mcp.json`). We retain a minimal Power containing only `mcp.json` �
 adds MCP config support or Kiro adds another way to configure MCP servers, the Power
 can be removed entirely.
 
+### Why not use sub-agents?
+
+Sub-agents (spawning a child agent with its own context and system prompt) are useful
+when a task requires deep, isolated reasoning that would pollute the main agent's
+context — e.g., "analyze these inputs and produce a structured result." The original
+Strands-based planner and evaluator were effectively sub-agents.
+
+We don't use sub-agents in the current design because:
+
+1. **The IDE agent is capable enough.** With the right steering files and reference
+   material loaded on demand, the IDE agent can handle planning, evaluation, and
+   execution without needing a separate reasoning context.
+2. **Sub-agents add complexity.** Each sub-agent needs its own system prompt, tool
+   access, and result serialization. This is more code to maintain and debug.
+3. **Sub-agents conflict with T1.** Spawning a sub-agent means either bundling a model
+   (violates T1) or using client sampling, which not all IDEs support reliably.
+4. **Steering files scale better.** Rather than isolating reasoning in a sub-agent, we
+   load focused reference files on demand (T3). The agent gets the knowledge it needs
+   for the current phase without carrying the full workflow in context.
+
+If a future phase proves too complex for the IDE agent with steering files alone (e.g.,
+a planning step that needs to reason over very large inputs), sub-agents can be
+reconsidered — but the burden of proof is on the sub-agent approach to justify the
+added complexity.
+
 ### Why 500 lines as the limit?
 
 - Claude Code recommends < 200 lines for CLAUDE.md files
