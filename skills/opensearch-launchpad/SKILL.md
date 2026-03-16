@@ -71,6 +71,9 @@ Python CLI for all OpenSearch operations. Subcommands:
 | `load-sample --source-type TYPE [--source-value VALUE]` | Load sample documents |
 | `cleanup` | Stop UI server and clean up |
 | `read-knowledge --file FILENAME` | Read a knowledge base reference file |
+| `deploy-agentic-model [--access-key KEY --secret-key KEY --region REGION]` | Deploy Bedrock Claude for agentic search |
+| `create-flow-agent --name NAME --model-id ID` | Create a flow agent for agentic search |
+| `create-agentic-pipeline --name NAME --agent-id ID --index INDEX` | Create and attach an agentic search pipeline |
 
 ## Workflow Phases
 
