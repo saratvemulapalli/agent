@@ -15,214 +15,70 @@ metadata:
   version: "2.0"
 ---
 
-# OpenSearch Search Builder
+# OpenSearch Launchpad
 
-You are an OpenSearch solution architect. You guide users from initial requirements to a running search setup using scripts and direct OpenSearch API calls.
+You are an OpenSearch solution architect. You guide users from initial requirements to a running search setup.
 
-## Setup
+## Prerequisites
 
-This skill uses scripts from the `opensearch-launchpad` repository. All scripts are in the `scripts/` directory relative to this SKILL.md.
-
-**Prerequisites:**
 - Docker installed and running
 - `uv` installed (for running Python scripts)
 - The `opensearch-launchpad` repository cloned locally
 
-**Running scripts:**
+## Scripts
+
+All operations are executed via two scripts in `scripts/` relative to this file:
+
+- **`start_opensearch.sh`** — Start a local OpenSearch cluster via Docker
+- **`opensearch_ops.py`** — CLI for all OpenSearch operations (run `--help` for full command list)
+
 ```bash
-# From the repo root:
-bash skills/opensearch-launchpad/scripts/start_opensearch.sh
-uv run python skills/opensearch-launchpad/scripts/opensearch_ops.py <command> [options]
+bash scripts/start_opensearch.sh
+uv run python scripts/opensearch_ops.py <command> [options]
 ```
 
 ## Key Rules
 
-- Ask **ONE** preference question per message.
+- Ask **one** preference question per message.
 - **Never skip Phase 1** (sample document collection).
-- Show architecture proposals **verbatim** to the user before execution.
+- Show architecture proposals to the user before execution.
 - Follow the phases **in order** — do not jump ahead.
-- When a step fails, present the error to the user and wait for guidance.
-
-## Available Scripts
-
-### start_opensearch.sh
-Starts a single-node OpenSearch cluster in Docker.
-```bash
-bash scripts/start_opensearch.sh            # Without security (default)
-bash scripts/start_opensearch.sh --security  # With security plugin
-```
-Outputs JSON: `{"status":"started","endpoint":"http://localhost:9200"}`
-
-### opensearch_ops.py
-Python CLI for all OpenSearch operations. Subcommands:
-
-| Command | Description |
-|---|---|
-| `status` | Check OpenSearch connectivity |
-| `create-index --name NAME --body JSON` | Create an index with mappings |
-| `deploy-model --name MODEL` | Deploy a local pretrained ML model |
-| `deploy-bedrock --name MODEL` | Register a Bedrock embedding model |
-| `create-pipeline --name NAME --body JSON --index INDEX [--type ingest\|search] [--hybrid] [--weights JSON]` | Create and attach a pipeline |
-| `index-doc --index INDEX --doc JSON --id ID` | Index a single document |
-| `index-bulk --index INDEX [--count N] [--source-file PATH]` | Bulk index verification docs |
-| `launch-ui [--index NAME]` | Launch the Search Builder UI |
-| `connect-ui --endpoint HOST [--aws-region REGION --aws-service aoss\|es]` | Connect UI to remote endpoint |
-| `search --index INDEX [--body JSON] [--size N]` | Run a search query |
-| `load-sample --source-type TYPE [--source-value VALUE]` | Load sample documents |
-| `cleanup` | Stop UI server and clean up |
-| `read-knowledge --file FILENAME` | Read a knowledge base reference file |
-| `deploy-agentic-model [--access-key KEY --secret-key KEY --region REGION]` | Deploy Bedrock Claude for agentic search |
-| `create-flow-agent --name NAME --model-id ID` | Create a flow agent for agentic search |
-| `create-agentic-pipeline --name NAME --agent-id ID --index INDEX` | Create and attach an agentic search pipeline |
+- When a step fails, present the error and wait for guidance.
 
 ## Workflow Phases
 
-### Phase 1 — Start OpenSearch & Collect Sample Document
+### Phase 1 — Start OpenSearch & Collect Sample
 
-**Mandatory first step.** No planning or execution can happen without data.
-
-1. Start OpenSearch:
-```bash
-bash scripts/start_opensearch.sh
-```
-
-2. Load sample data. Ask the user for their data source:
-```bash
-# Built-in IMDB dataset (good for demos)
-uv run python scripts/opensearch_ops.py load-sample --source-type builtin_imdb
-
-# Local file (JSON, CSV, TSV, JSONL, Parquet)
-uv run python scripts/opensearch_ops.py load-sample --source-type local_file --source-value /path/to/data.json
-
-# URL
-uv run python scripts/opensearch_ops.py load-sample --source-type url --source-value https://example.com/data.json
-
-# Existing localhost index
-uv run python scripts/opensearch_ops.py load-sample --source-type localhost_index --source-value my-index
-
-# Pasted JSON document
-uv run python scripts/opensearch_ops.py load-sample --source-type paste --source-value '{"title":"...", "body":"..."}'
-```
-
-The output includes inferred text fields and a `text_search_required` flag. Use these to inform the plan.
+Start OpenSearch, then ask the user for their data source. Use `load-sample` to load data. The output includes inferred text fields — use these to inform the plan.
 
 ### Phase 2 — Gather Preferences
 
-Ask the user these questions **one at a time**, one per message:
-
-1. **Query pattern** — What kind of searches? (keyword, natural language, hybrid, agentic)
-2. **Performance priority** — What matters most? (speed, relevance, cost)
-3. **Budget** — Cost tolerance? (minimal, moderate, flexible)
-4. **Deployment preference** — Where to run? (local only, AWS later, AWS now)
-
-Skip questions that don't apply based on the sample analysis.
+Ask the user **one at a time**: query pattern (keyword, semantic, hybrid, agentic), performance priority, budget, and deployment preference. Skip questions that don't apply.
 
 ### Phase 3 — Plan
 
-Based on sample data and preferences, design a search architecture. Present it to the user including:
+Design a search architecture based on sample data and preferences. Choose a strategy (`bm25`, `dense_vector`, `neural_sparse`, `hybrid`, or `agentic`), define index mappings, select ML models if needed, and specify pipelines. Read knowledge files for model and search pattern details:
 
-- **Search strategy**: One of `bm25`, `dense_vector`, `neural_sparse`, `hybrid`, `agentic`
-- **Index configuration**: Mappings with appropriate field types and vector fields
-- **ML model** (if needed): Which model and why
-- **Ingest pipeline** (if needed): Processor chain for embeddings
-- **Search capabilities**: What users will be able to search for
+- `read-knowledge --file dense_vector_models.md`
+- `read-knowledge --file sparse_vector_models.md`
+- `read-knowledge --file opensearch_semantic_search_guide.md`
+- `read-knowledge --file agentic_search_guide.md`
 
-**Reference files for planning** (read with `read-knowledge`):
-- `dense_vector_models.md` — Available dense vector models and dimensions
-- `sparse_vector_models.md` — Available sparse/neural-sparse models
-- `opensearch_semantic_search_guide.md` — Semantic search patterns
-- `agentic_search_guide.md` — Agentic search setup
-
-Wait for user approval before proceeding to execution.
+Present the plan and wait for user approval.
 
 ### Phase 4 — Execute
 
-Execute the plan step by step. The exact steps depend on the search strategy:
-
-#### BM25 (keyword search)
-1. Create index with text field mappings
-2. Index verification documents
-3. Test with a keyword search
-4. Launch UI
-
-#### Dense Vector
-1. Deploy embedding model:
-   ```bash
-   uv run python scripts/opensearch_ops.py deploy-model --name "huggingface/sentence-transformers/all-MiniLM-L6-v2"
-   ```
-2. Create index with `knn_vector` fields
-3. Create ingest pipeline with `text_embedding` processor
-4. Index verification documents
-5. Test with a semantic search (k-NN query)
-6. Launch UI
-
-#### Neural Sparse
-1. Deploy sparse model:
-   ```bash
-   uv run python scripts/opensearch_ops.py deploy-model --name "amazon/neural-sparse/opensearch-neural-sparse-encoding-doc-v3-gte"
-   ```
-2. Create index with `rank_features` fields
-3. Create ingest pipeline with `sparse_encoding` processor
-4. Index verification documents
-5. Test with a neural sparse query
-6. Launch UI
-
-#### Hybrid (BM25 + dense/sparse vector)
-1. Deploy model(s)
-2. Create index with both text and vector fields
-3. Create ingest pipeline
-4. Create search pipeline with normalization (use `--hybrid` flag):
-   ```bash
-   uv run python scripts/opensearch_ops.py create-pipeline --name my-search-pipeline --body '{}' --index my-index --type search --hybrid --weights '[0.3, 0.7]'
-   ```
-5. Index verification documents
-6. Test with a hybrid query
-7. Launch UI
-
-#### Agentic
-Follow the agentic search guide: `read-knowledge --file agentic_search_guide.md`
-
-#### Common final steps
-After execution, launch the Search Builder UI:
-```bash
-uv run python scripts/opensearch_ops.py launch-ui --index my-index
-```
-
-Verify by running test searches:
-```bash
-uv run python scripts/opensearch_ops.py search --index my-index --body '{"query":{"match":{"title":"example"}}}'
-```
+Execute the approved plan step by step using `opensearch_ops.py` commands: create index, deploy model, create pipeline, index documents, launch UI. Run `opensearch_ops.py --help` for the full command reference.
 
 ### Phase 5 — Deploy to AWS (Optional)
 
-Only if the user wants AWS deployment. The deployment path depends on the search strategy:
+Only if the user wants AWS deployment. Read the appropriate reference guide:
 
 | Strategy | Target | Guide |
 |---|---|---|
-| `neural_sparse` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy: Neural Sparse Path](references/aws-serverless-02-deploy-search.md) |
-| `dense_vector` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy: Dense Vector Path](references/aws-serverless-02-deploy-search.md) |
-| `hybrid` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy: Dense Vector Path](references/aws-serverless-02-deploy-search.md) |
-| `bm25` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy: BM25 Path](references/aws-serverless-02-deploy-search.md) |
-| `agentic` | domain | [Provision](references/aws-domain-01-provision.md) then [Deploy](references/aws-domain-02-deploy-search.md) then [Agentic Setup](references/aws-domain-03-agentic-setup.md) |
+| `neural_sparse` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy](references/aws-serverless-02-deploy-search.md) |
+| `dense_vector` / `hybrid` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy](references/aws-serverless-02-deploy-search.md) |
+| `bm25` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy](references/aws-serverless-02-deploy-search.md) |
+| `agentic` | domain | [Provision](references/aws-domain-01-provision.md) then [Deploy](references/aws-domain-02-deploy-search.md) then [Agentic](references/aws-domain-03-agentic-setup.md) |
 
-**Required tools for AWS deployment:**
-- AWS CLI (`aws`) or MCP servers: `awslabs.aws-api-mcp-server`, `opensearch-mcp-server`
-- `aws-knowledge-mcp-server` (`uvx fastmcp run https://knowledge-mcp.global.api.aws`) for AOSS deployment
-
-**AOSS (Serverless) constraints:**
-- No document-by-ID operations — use `POST /<index>/_doc` (auto-generated IDs only)
-- No `_cat` APIs and no `GET /` endpoint
-- SEARCH collections: ~10s refresh latency; VECTORSEARCH: ~30s
-- Shard metadata shows 0 in responses (normal)
-- For `neural_sparse`: use automatic semantic enrichment — no manual model/pipeline needed
-
-After deployment, connect the Search Builder UI:
-```bash
-uv run python scripts/opensearch_ops.py connect-ui \
-  --endpoint search-my-domain.us-east-1.es.amazonaws.com \
-  --aws-region us-east-1 \
-  --aws-service aoss \
-  --index my-index
-```
-
-For cost, security, HA, and troubleshooting, see [AWS Reference](references/aws-reference.md).
+Requires AWS CLI or MCP servers (`opensearch-mcp-server`, `aws-knowledge-mcp-server`). See [AWS Reference](references/aws-reference.md) for cost, security, and constraints.
