@@ -2,6 +2,14 @@
 
 An MCP-powered assistant that guides you from initial requirements to a running OpenSearch search setup. It collects a sample document, gathers preferences, plans a search architecture, and executes the plan — creating indices, ML models, ingest pipelines, and a local search UI — with optional deployment to Amazon OpenSearch Service or Serverless.
 
+The package is built from **`opensearch_orchestrator`** and is distributed for:
+
+| Platform | Location | Purpose |
+|----------|----------|---------|
+| **Kiro** | `kiro/opensearch-launchpad/` | Kiro Power (workflow + MCP config) |
+| **Claude** | `.claude/skills/opensearch-search-builder/` | Claude Agent Skill + references |
+| **Cursor** | `cursor/opensearch-launchpad/` | Cursor plugin (MCP config + skill for Cursor/marketplace) |
+
 ---
 
 ## Kiro Power (Primary Integration)
