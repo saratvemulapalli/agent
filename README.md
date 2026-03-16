@@ -12,6 +12,71 @@ The `mcp.json` at the repo root runs `uvx opensearch-launchpad@latest` — no lo
 
 ---
 
+## Agent Skills (Claude Code, Cursor, Kiro)
+
+OpenSearch Launchpad is also available as an **Agent Skill** that works across
+multiple IDEs. The skill lives in `skills/opensearch-launchpad/` with symlinks
+for each IDE's discovery path:
+
+```
+skills/opensearch-launchpad/    # Source of truth
+.claude/skills -> ../skills     # Claude Code + Cursor
+.cursor/skills -> ../skills     # Cursor (explicit)
+.kiro/skills   -> ../skills     # Kiro
+```
+
+### Claude Code
+
+1. Clone the repo (the `.claude/skills` symlink is checked in):
+   ```bash
+   git clone https://github.com/opensearch-project/opensearch-launchpad.git
+   cd opensearch-launchpad
+   ```
+
+2. Add the MCP server to your project config (`.mcp.json`):
+   ```json
+   {
+     "mcpServers": {
+       "opensearch-launchpad": {
+         "command": "uvx",
+         "args": ["opensearch-launchpad@latest"]
+       }
+     }
+   }
+   ```
+
+3. Start Claude Code — the skill is auto-discovered from `.claude/skills/opensearch-launchpad/SKILL.md`.
+
+### Cursor
+
+1. Clone the repo (the `.cursor/skills` symlink is checked in):
+   ```bash
+   git clone https://github.com/opensearch-project/opensearch-launchpad.git
+   cd opensearch-launchpad
+   ```
+
+2. Add the MCP server to `.cursor/mcp.json`:
+   ```json
+   {
+     "mcpServers": {
+       "opensearch-launchpad": {
+         "command": "uvx",
+         "args": ["opensearch-launchpad@latest"]
+       }
+     }
+   }
+   ```
+
+3. Open the project in Cursor — the skill is discovered from `.cursor/skills/opensearch-launchpad/SKILL.md`.
+
+### Kiro
+
+Kiro users can install the **Kiro Power** (see above) for the released, production
+experience. The `.kiro/skills` symlink is also available for Agent Skills support
+as Kiro adopts the standard.
+
+---
+
 ## Standalone CLI (Local Development)
 
 Start the interactive orchestrator in a terminal:
