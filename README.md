@@ -33,19 +33,27 @@ skills/opensearch-launchpad/    # Source of truth
    cd opensearch-launchpad
    ```
 
-2. Add the MCP server to your project config (`.mcp.json`):
-   ```json
-   {
-     "mcpServers": {
-       "opensearch-launchpad": {
-         "command": "uvx",
-         "args": ["opensearch-launchpad@latest"]
-       }
-     }
-   }
-   ```
+2. Start Claude Code — the skill is auto-discovered from `.claude/skills/opensearch-launchpad/SKILL.md`.
 
-3. Start Claude Code — the skill is auto-discovered from `.claude/skills/opensearch-launchpad/SKILL.md`.
+The Agent Skill guides the IDE agent through the full workflow using scripts in
+`skills/opensearch-launchpad/scripts/` — no custom MCP server needed. The IDE agent
+runs the scripts directly (start OpenSearch, create indices, deploy models, etc.).
+
+For AWS deployment (Phase 5), add these MCP servers to `.mcp.json`:
+```json
+{
+  "mcpServers": {
+    "opensearch-mcp-server": {
+      "command": "uvx",
+      "args": ["opensearch-mcp-server-py@latest"]
+    },
+    "aws-knowledge-mcp-server": {
+      "command": "uvx",
+      "args": ["fastmcp", "run", "https://knowledge-mcp.global.api.aws"]
+    }
+  }
+}
+```
 
 ### Cursor
 
@@ -55,25 +63,17 @@ skills/opensearch-launchpad/    # Source of truth
    cd opensearch-launchpad
    ```
 
-2. Add the MCP server to `.cursor/mcp.json`:
-   ```json
-   {
-     "mcpServers": {
-       "opensearch-launchpad": {
-         "command": "uvx",
-         "args": ["opensearch-launchpad@latest"]
-       }
-     }
-   }
-   ```
+2. Open the project in Cursor — the skill is discovered from `.cursor/skills/opensearch-launchpad/SKILL.md`.
 
-3. Open the project in Cursor — the skill is discovered from `.cursor/skills/opensearch-launchpad/SKILL.md`.
+Same as Claude Code: the agent follows the skill instructions and runs scripts
+directly. No custom MCP server. For AWS deployment, add the same MCP servers
+to `.cursor/mcp.json`.
 
 ### Kiro
 
 Kiro users can install the **Kiro Power** (see above) for the released, production
-experience. The `.kiro/skills` symlink is also available for Agent Skills support
-as Kiro adopts the standard.
+experience, which uses the `opensearch-launchpad` MCP server. The `.kiro/skills`
+symlink is also available for Agent Skills support as Kiro adopts the standard.
 
 ---
 

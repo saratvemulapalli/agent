@@ -172,55 +172,42 @@ phase-specific details load on demand via reference files or MCP tool calls.
 ### 5.2 High-Level Architecture
 
 ```
-User <-> IDE Agent <-> Agent Skills / Steering Files (knowledge + procedures)
+User <-> IDE Agent <-> Agent Skills (SKILL.md + references)
               |                |
               |          references/ loaded on demand
               |
-              +------> MCP Protocol <-> mcp_server.py <-> OrchestratorEngine
-                                              |
-                                   orchestration tools (predictability)
-                                   execution tools (real operations)
-                                              |
-                                   external MCP servers
-                                   (AWS API, OpenSearch MCP, AWS Knowledge)
+              +------> scripts/ (local execution)
+              |            start_opensearch.sh, opensearch_ops.py
+              |
+              +------> external MCP servers (AWS deployment only)
+                           opensearch-mcp-server, aws-knowledge-mcp-server
 ```
 
-**Layer 1 — Steering Files (knowledge — the durable layer)**
+**Layer 1 — Agent Skills (knowledge — the durable layer)**
 - Skills discovered at startup via name + description (~100 tokens each)
 - Full SKILL.md loads on activation (< 500 lines)
 - Reference files (procedures, domain guides) load on demand
 - This is where all procedural knowledge lives: how to provision, how to deploy,
   how to configure search architectures
-- Steering files persist and improve independently of the orchestration layer
+- The IDE agent is the orchestrator — no custom MCP server needed
 
-**Layer 2 — Orchestration Tools (predictability — the shrinking layer)**
-- Keep the agent on track in multi-phase workflows
-- Route to the right steering file at the right time
-- Track workflow state (which phase, what's been completed)
-- Expected to thin over time as agents improve
+**Layer 2 — Scripts (local execution)**
+- `start_opensearch.sh` — start a local OpenSearch cluster via Docker
+- `opensearch_ops.py` — CLI for all OpenSearch operations (create index, deploy
+  model, create pipeline, index docs, launch UI, etc.)
+- The IDE agent runs scripts directly based on SKILL.md instructions
+- Scripts replace the custom MCP server's execution tools for the Agent Skills path
 
-**Layer 3 — Execution Tools + External MCP Servers (operations — the permanent layer)**
-- Execution tools: `create_index`, `load_sample`, `launch_search_ui` — do real work
-- External MCP servers: AWS API, OpenSearch MCP, AWS Knowledge — the actual infrastructure
-  surface for cloud deployment
-- These persist regardless of how smart agents become
+**Layer 3 — External MCP Servers (AWS deployment only)**
+- `opensearch-mcp-server` — OpenSearch operations on remote clusters
+- `aws-knowledge-mcp-server` — AWS documentation lookup
+- `awslabs.aws-api-mcp-server` — AWS API calls for provisioning
+- Only needed for Phase 5 (AWS deployment); local workflow is script-only
 
-### 5.2.1 Architecture Trajectory
-
-```
-Today:      steering files + orchestration tools + execution tools + external MCP servers
-            (orchestration needed because agents drift in multi-phase workflows)
-
-Near-term:  steering files + lighter orchestration + execution tools + external MCP servers
-            (agents improve; orchestration shrinks to critical guardrails only)
-
-Future:     steering files + execution tools + external MCP servers
-            (agents reliably follow steering files; orchestration optional or removed)
-```
-
-The orchestration layer is a compensator for current agent limitations, not a permanent
-architectural fixture. Design decisions should favor putting knowledge in steering
-files (durable) over encoding it in orchestration tools (transitional).
+The Agent Skills path has no custom MCP server and no orchestration layer. The IDE
+agent follows SKILL.md instructions, runs scripts for execution, and reads reference
+files on demand. This is a cleaner architecture that trusts the IDE agent to maintain
+workflow state — if the agent drifts, the SKILL.md rules and phase structure correct it.
 
 ### 5.3 Skill Structure
 
@@ -318,21 +305,19 @@ Agent Skills content. The only difference is the directory convention for skill
 discovery (`.kiro/skills/` vs `.claude/skills/`), which can be resolved with
 symlinks or by placing skills in a shared location.
 
-### 5.7 Steering Files vs Orchestration Tools vs Execution Tools
+### 5.7 Where Things Live (Agent Skills Path)
 
 | Concern | Where it lives | Why |
 |---------|---------------|-----|
-| Procedures (how to provision, deploy, configure) | Steering files / references | Durable knowledge; persists as orchestration thins |
-| Domain expertise (search architecture, model selection) | Steering files / references | Durable knowledge |
-| Behavioral rules (one question per message, etc.) | Steering file (SKILL.md) | Shapes agent reasoning across all phases |
-| Workflow routing (which file to read next) | Orchestration tools | Compensates for agents losing track |
-| Phase tracking (where we are) | Orchestration tools | Compensates for agents losing state |
-| Conditional logic (skip questions based on data) | Orchestration tools | Agents can't reliably evaluate conditions in prose |
-| Real operations (create index, start UI) | Execution tools | Actual work; always needed |
+| Procedures (how to provision, deploy, configure) | SKILL.md + references | Durable knowledge the IDE agent follows |
+| Domain expertise (search architecture, model selection) | References + knowledge files | Loaded on demand per phase |
+| Behavioral rules (one question per message, etc.) | SKILL.md | Shapes agent reasoning across all phases |
+| Workflow routing (which phase, which file next) | SKILL.md phase structure | IDE agent tracks state; no orchestration layer |
+| Local operations (create index, deploy model, start UI) | Scripts (`scripts/`) | IDE agent runs directly via bash/python |
 | AWS infrastructure (provision, configure) | External MCP servers | AWS API, OpenSearch MCP, AWS Knowledge |
 
-**Key insight:** The middle column (orchestration tools) is the one expected to shrink.
-The outer columns (steering files and execution tools/external MCP servers) are permanent.
+**Key difference from Kiro Power path:** No custom MCP server, no orchestration
+engine. The IDE agent is the orchestrator, guided by SKILL.md.
 
 ---
 
@@ -340,29 +325,34 @@ The outer columns (steering files and execution tools/external MCP servers) are 
 
 ```
 opensearch-launchpad/
-    skills/
-        opensearch-launchpad/               # Single skill (shared by all IDEs)
-            SKILL.md                        # < 300 lines: rules, tool overview, workflow
-            references/
-                phase1-collect-sample.md    # Phase 1 procedures (< 500 lines each)
-                phase2-preferences.md       # Phase 2 procedures
-                phase3-planning.md          # Phase 3 procedures
-                phase4-execution.md         # Phase 4 procedures
-                phase5-aws-deployment.md    # Phase 5 overview + routing
-                serverless-provision.md     # AWS serverless provisioning steps
-                serverless-deploy.md        # AWS serverless search deployment
-                domain-provision.md         # AWS domain provisioning steps
-                domain-deploy.md            # AWS domain search deployment
-                domain-agentic.md           # AWS agentic search setup
-                aws-reference.md            # Cost, security, HA reference
-    .kiro/
-        skills/ -> ../skills                # Symlink (Kiro skill discovery)
+    skills/                                 # Source of truth for Agent Skills
+        opensearch-launchpad/
+            SKILL.md                        # Workflow instructions (< 500 lines)
+            scripts/                        # Execution scripts (IDE agent runs directly)
+                start_opensearch.sh         # Start local OpenSearch via Docker
+                opensearch_ops.py           # CLI for all OpenSearch operations
+            references/                     # Loaded on demand per phase
+                aws-serverless-01-provision.md
+                aws-serverless-02-deploy-search.md
+                aws-domain-01-provision.md
+                aws-domain-02-deploy-search.md
+                aws-domain-03-agentic-setup.md
+                aws-reference.md
+                knowledge/                  # Domain knowledge
+                    opensearch_semantic_search_guide.md
+                    dense_vector_models.md
+                    sparse_vector_models.md
+                    agentic_search_guide.md
     .claude/
-        skills/ -> ../skills                # Symlink (Claude Code / Cursor discovery)
+        skills/ -> ../skills                # Symlink (Claude Code + Cursor)
+    .cursor/
+        skills/ -> ../skills                # Symlink (Cursor explicit)
+    .kiro/
+        skills/ -> ../skills                # Symlink (Kiro)
     kiro/
         opensearch-launchpad/               # Full Kiro Power (released, production)
             POWER.md                        # Workflow instructions for Kiro agent
-            mcp.json                        # MCP server config
+            mcp.json                        # MCP server config (opensearch-launchpad)
             steering/                       # Step-by-step procedures for Kiro
                 opensearch-workflow.md
                 aws-opensearch-serverless.md
@@ -370,8 +360,8 @@ opensearch-launchpad/
                 oui-design-system.md
                 oui-requirements.md
                 aws/                        # AWS deployment sub-procedures
-    opensearch_orchestrator/
-        mcp_server.py                       # MCP server (shared by all IDEs)
+    opensearch_orchestrator/                # Custom MCP server (Kiro Power path only)
+        mcp_server.py                       # MCP server entry point
         orchestrator_engine.py              # State machine + orchestration routing
         planning_session.py
         solution_planning_assistant.py
@@ -391,23 +381,26 @@ opensearch-launchpad/
     pyproject.toml
 ```
 
-The `skills/` directory at the repo root is the single source of truth. IDE-specific
-directories (`.kiro/skills/`, `.claude/skills/`) symlink to it, so all IDEs read the
-same skill content with zero duplication.
+The `skills/` directory at the repo root is the single source of truth for Agent
+Skills. IDE-specific directories (`.claude/skills/`, `.cursor/skills/`,
+`.kiro/skills/`) symlink to it, so all IDEs read the same skill content with zero
+duplication. The `opensearch_orchestrator/` module is used only by the Kiro Power
+path — the Agent Skills path uses scripts instead.
 
 ---
 
 ## 7. Technical Stack
 
-| Concern | Technology |
-|---------|-----------|
-| Agent orchestration | IDE-native agent (no bundled LLM) |
-| Skill format | Agent Skills open standard (agentskills.io) |
-| MCP server | `fastmcp` (via `mcp` package) |
-| State machine | `OrchestratorEngine` in `orchestrator_engine.py` |
-| OpenSearch client | `opensearch-py` |
-| Package manager | `uv` / `uvx` |
-| Distribution | PyPI (`opensearch-launchpad`) |
+| Concern | Agent Skills Path | Kiro Power Path |
+|---------|-------------------|-----------------|
+| Agent orchestration | IDE-native agent | IDE-native agent |
+| Knowledge delivery | Agent Skills (`SKILL.md` + references) | Kiro Power (`POWER.md` + steering) |
+| Local execution | Scripts (`start_opensearch.sh`, `opensearch_ops.py`) | Custom MCP server (`opensearch-launchpad`) |
+| Orchestration | None (IDE agent follows SKILL.md) | `OrchestratorEngine` state machine |
+| AWS deployment | External MCP servers + AWS CLI | External MCP servers + AWS CLI |
+| OpenSearch client | `opensearch-py` (via scripts) | `opensearch-py` (via MCP server) |
+| Package manager | `uv` | `uv` / `uvx` |
+| Distribution | Git clone (skills + scripts) | PyPI (`opensearch-launchpad`) |
 | IDE integration | Kiro Power (released); Agent Skills (validating for other IDEs) |
 
 ---

@@ -31,8 +31,8 @@ This skill uses scripts from the `opensearch-launchpad` repository. All scripts 
 **Running scripts:**
 ```bash
 # From the repo root:
-bash .claude/skills/opensearch-search-builder/scripts/start_opensearch.sh
-uv run python .claude/skills/opensearch-search-builder/scripts/opensearch_ops.py <command> [options]
+bash skills/opensearch-launchpad/scripts/start_opensearch.sh
+uv run python skills/opensearch-launchpad/scripts/opensearch_ops.py <command> [options]
 ```
 
 ## Key Rules
