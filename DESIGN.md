@@ -106,9 +106,12 @@ never forking the core knowledge or procedures.
 
 ---
 
-## 4. Previous Architecture (v0.x — Kiro-only)
+## 4. Current Architecture (Kiro Power — Released)
 
-### 4.1 How It Worked
+The Kiro Power is the released, production path. It remains fully supported while
+the Agent Skills architecture (S5) is validated across IDEs.
+
+### 4.1 How It Works
 
 ```
 User <-> Kiro Agent <-> MCP Protocol <-> mcp_server.py <-> OrchestratorEngine
@@ -141,7 +144,7 @@ User <-> Kiro Agent <-> MCP Protocol <-> mcp_server.py <-> OrchestratorEngine
 
 ---
 
-## 5. Architecture (v1.0 — Multi-IDE via Agent Skills)
+## 5. Target Architecture (Multi-IDE via Agent Skills)
 
 ### 5.1 Why Agent Skills?
 
@@ -221,8 +224,9 @@ files (durable) over encoding it in orchestration tools (transitional).
 
 ### 5.3 Skill Structure
 
-One skill, one workflow. The monolithic POWER.md becomes a single Agent Skill
-with reference files for progressive disclosure:
+One skill, one workflow. The POWER.md workflow is also expressed as a single
+Agent Skill with reference files for progressive disclosure. The Kiro Power
+remains the production path until Agent Skills is validated across IDEs:
 
 ```
 skills/opensearch-launchpad/
@@ -289,21 +293,20 @@ configuration. Each IDE handles MCP config differently:
 | **Cursor** | `.cursor/mcp.json` |
 | **VS Code** | `.vscode/mcp.json` |
 
-For Kiro, we retain a minimal Power (`kiro/opensearch-launchpad/`) containing only
-`mcp.json` — no `POWER.md`, no steering files. All knowledge and procedures live in
-Agent Skills. Kiro's docs note that "for MCP integrations, powers are usually a
-better fit" — but the Power's role here is strictly MCP config delivery, not knowledge.
+For Kiro, the full Power (`kiro/opensearch-launchpad/`) is retained with `POWER.md`,
+`mcp.json`, and steering files. This is the released, production path. The Agent
+Skills structure runs in parallel for other IDEs and will eventually serve Kiro as
+well once validated. Kiro's docs note that "for MCP integrations, powers are usually
+a better fit" — so the Power remains the primary Kiro integration.
 
 For other IDEs, the SKILL.md body includes setup instructions telling the user how
-to configure the MCP server for their IDE. Long-term, if Agent Skills adds an MCP
-config mechanism or IDEs converge on a standard location, even the minimal Kiro Power
-can be removed.
+to configure the MCP server for their IDE.
 
 ### 5.6 IDE Integration Matrix
 
 | IDE | Skills Location | Skill Discovery | MCP Config |
 |-----|----------------|-----------------|------------|
-| **Kiro** | `.kiro/skills/` | Auto (description match) | Power `mcp.json` |
+| **Kiro** | `.kiro/skills/` (future) | Power `POWER.md` + steering (current) | Power `mcp.json` |
 | **Claude Code** | `.claude/skills/` | Auto or `/opensearch-launchpad` | `claude_desktop_config.json` |
 | **Cursor** | `.claude/skills/` | Auto on keyword match | `.cursor/mcp.json` |
 | **VS Code Copilot** | Agent Skills standard | Auto | `.vscode/mcp.json` |
@@ -357,8 +360,16 @@ opensearch-launchpad/
     .claude/
         skills/ -> ../skills                # Symlink (Claude Code / Cursor discovery)
     kiro/
-        opensearch-launchpad/
-            mcp.json                        # MCP server config only (no POWER.md)
+        opensearch-launchpad/               # Full Kiro Power (released, production)
+            POWER.md                        # Workflow instructions for Kiro agent
+            mcp.json                        # MCP server config
+            steering/                       # Step-by-step procedures for Kiro
+                opensearch-workflow.md
+                aws-opensearch-serverless.md
+                aws-opensearch-domain.md
+                oui-design-system.md
+                oui-requirements.md
+                aws/                        # AWS deployment sub-procedures
     opensearch_orchestrator/
         mcp_server.py                       # MCP server (shared by all IDEs)
         orchestrator_engine.py              # State machine + orchestration routing
@@ -397,7 +408,7 @@ same skill content with zero duplication.
 | OpenSearch client | `opensearch-py` |
 | Package manager | `uv` / `uvx` |
 | Distribution | PyPI (`opensearch-launchpad`) |
-| IDE integration | Agent Skills (universal); Kiro Power for `mcp.json` only |
+| IDE integration | Kiro Power (released); Agent Skills (validating for other IDEs) |
 
 ---
 
@@ -407,9 +418,9 @@ same skill content with zero duplication.
 
 Agent Skills is supported by 25+ tools including all our targets: Kiro, Cursor,
 Claude Code, VS Code, JetBrains, Gemini CLI, and more. Writing one SKILL.md gives us
-all of these without maintaining separate `.cursorrules`, `CLAUDE.md`, and `POWER.md`
-files with duplicated content. Kiro supports Agent Skills natively (`.kiro/skills/`),
-so the only Kiro-specific artifact is `mcp.json` for MCP server configuration.
+all of these without maintaining separate `.cursorrules` and `CLAUDE.md` files with
+duplicated content. The Kiro Power remains the released production path; Agent Skills
+runs in parallel and will eventually unify the knowledge layer across all IDEs.
 
 ### Why keep procedures in steering files instead of MCP tool responses?
 
@@ -443,13 +454,15 @@ improvements in the IDE's own model. By delegating to the IDE agent and providin
 knowledge via skills + MCP, we get better results with less complexity. Strands-based
 agents remain available as fallbacks for standalone CLI mode.
 
-### Why keep a minimal Kiro Power?
+### Why keep the full Kiro Power?
 
-Agent Skills has no mechanism for MCP server configuration. Kiro delivers MCP config
-via Powers (`mcp.json`). We retain a minimal Power containing only `mcp.json` — no
-`POWER.md`, no steering files. All knowledge lives in Agent Skills. If Agent Skills
-adds MCP config support or Kiro adds another way to configure MCP servers, the Power
-can be removed entirely.
+The Kiro Power (`POWER.md` + `mcp.json` + steering files) is the released,
+production-tested path. It remains fully supported while the Agent Skills
+architecture is validated across other IDEs (Claude Code, Cursor, VS Code, etc.).
+The orchestrator, custom MCP server, and Kiro steering files are proven — removing
+them prematurely would risk the released experience. Once Agent Skills is validated,
+Kiro can transition to using Agent Skills for knowledge delivery while retaining
+the Power for MCP config (which Agent Skills has no mechanism for).
 
 ### Why not use sub-agents?
 
