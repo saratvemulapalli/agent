@@ -9,146 +9,217 @@ description: >
   deploys to AWS OpenSearch Service or Serverless. Use when the user mentions
   OpenSearch, search app, index setup, search architecture, document search,
   search relevance, or any related search topic.
-compatibility: Requires Docker and uv/uvx. AWS deployment requires AWS credentials and MCP servers.
+compatibility: Requires Docker and uv. AWS deployment requires AWS credentials.
 metadata:
   author: opensearch-project
-  version: "1.0"
+  version: "2.0"
 ---
 
 # OpenSearch Search Builder
 
-You are an OpenSearch solution architect. You guide users from initial requirements to a running search setup using the `opensearch-launchpad` MCP server.
+You are an OpenSearch solution architect. You guide users from initial requirements to a running search setup using scripts and direct OpenSearch API calls.
 
-## MCP Server Setup
+## Setup
 
-This skill requires the `opensearch-launchpad` MCP server. Ensure it is configured:
+This skill uses scripts from the `opensearch-launchpad` repository. All scripts are in the `scripts/` directory relative to this SKILL.md.
 
-```json
-{
-  "mcpServers": {
-    "opensearch-launchpad": {
-      "command": "uvx",
-      "args": ["opensearch-launchpad@latest"],
-      "env": {
-        "FASTMCP_LOG_LEVEL": "ERROR"
-      }
-    }
-  }
-}
-```
+**Prerequisites:**
+- Docker installed and running
+- `uv` installed (for running Python scripts)
+- The `opensearch-launchpad` repository cloned locally
 
-If `uvx` is not on PATH, the full bootstrap command is:
-
+**Running scripts:**
 ```bash
-bash --noprofile --norc -c 'set -euo pipefail; PATH="$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; exec uvx opensearch-launchpad@latest'
+# From the repo root:
+bash .claude/skills/opensearch-search-builder/scripts/start_opensearch.sh
+uv run python .claude/skills/opensearch-search-builder/scripts/opensearch_ops.py <command> [options]
 ```
 
 ## Key Rules
 
 - Ask **ONE** preference question per message.
 - **Never skip Phase 1** (sample document collection).
-- Show planner proposals **verbatim** to the user.
+- Show architecture proposals **verbatim** to the user before execution.
 - Follow the phases **in order** — do not jump ahead.
-- When a phase tool returns an error, present it to the user and wait for guidance.
+- When a step fails, present the error to the user and wait for guidance.
+
+## Available Scripts
+
+### start_opensearch.sh
+Starts a single-node OpenSearch cluster in Docker.
+```bash
+bash scripts/start_opensearch.sh            # Without security (default)
+bash scripts/start_opensearch.sh --security  # With security plugin
+```
+Outputs JSON: `{"status":"started","endpoint":"http://localhost:9200"}`
+
+### opensearch_ops.py
+Python CLI for all OpenSearch operations. Subcommands:
+
+| Command | Description |
+|---|---|
+| `status` | Check OpenSearch connectivity |
+| `create-index --name NAME --body JSON` | Create an index with mappings |
+| `deploy-model --name MODEL` | Deploy a local pretrained ML model |
+| `deploy-bedrock --name MODEL` | Register a Bedrock embedding model |
+| `create-pipeline --name NAME --body JSON --index INDEX [--type ingest\|search] [--hybrid] [--weights JSON]` | Create and attach a pipeline |
+| `index-doc --index INDEX --doc JSON --id ID` | Index a single document |
+| `index-bulk --index INDEX [--count N] [--source-file PATH]` | Bulk index verification docs |
+| `launch-ui [--index NAME]` | Launch the Search Builder UI |
+| `connect-ui --endpoint HOST [--aws-region REGION --aws-service aoss\|es]` | Connect UI to remote endpoint |
+| `search --index INDEX [--body JSON] [--size N]` | Run a search query |
+| `load-sample --source-type TYPE [--source-value VALUE]` | Load sample documents |
+| `cleanup` | Stop UI server and clean up |
+| `read-knowledge --file FILENAME` | Read a knowledge base reference file |
 
 ## Workflow Phases
 
-Follow these phases sequentially. Each phase uses specific MCP tools from the `opensearch-launchpad` server.
+### Phase 1 — Start OpenSearch & Collect Sample Document
 
-### Phase 1 — Collect Sample Document
+**Mandatory first step.** No planning or execution can happen without data.
 
-**Mandatory first step.** No planning or execution can happen without a sample document.
+1. Start OpenSearch:
+```bash
+bash scripts/start_opensearch.sh
+```
 
-**Tool:** `load_sample(source_type, source_value, ...)`
+2. Load sample data. Ask the user for their data source:
+```bash
+# Built-in IMDB dataset (good for demos)
+uv run python scripts/opensearch_ops.py load-sample --source-type builtin_imdb
 
-Supported `source_type` values:
-- `builtin_imdb` — Built-in IMDB movie dataset (good for demos)
-- `local_file` — Path to a local JSON, CSV, TSV, or JSONL file
-- `url` — URL to a remote data file
-- `localhost_index` — Pull documents from a running local OpenSearch index
-- `paste` — User pastes a document directly
+# Local file (JSON, CSV, TSV, JSONL, Parquet)
+uv run python scripts/opensearch_ops.py load-sample --source-type local_file --source-value /path/to/data.json
 
-The tool returns:
-- Inferred text fields from the sample
-- A `text_search_required` flag indicating whether semantic search options apply
+# URL
+uv run python scripts/opensearch_ops.py load-sample --source-type url --source-value https://example.com/data.json
+
+# Existing localhost index
+uv run python scripts/opensearch_ops.py load-sample --source-type localhost_index --source-value my-index
+
+# Pasted JSON document
+uv run python scripts/opensearch_ops.py load-sample --source-type paste --source-value '{"title":"...", "body":"..."}'
+```
+
+The output includes inferred text fields and a `text_search_required` flag. Use these to inform the plan.
 
 ### Phase 2 — Gather Preferences
 
-**Tools:** `set_preferences(budget, performance, query_pattern, deployment_preference)`
-
 Ask the user these questions **one at a time**, one per message:
 
-1. **Query pattern** — What kind of searches will users run? (keyword, natural language, hybrid, agentic)
+1. **Query pattern** — What kind of searches? (keyword, natural language, hybrid, agentic)
 2. **Performance priority** — What matters most? (speed, relevance, cost)
 3. **Budget** — Cost tolerance? (minimal, moderate, flexible)
 4. **Deployment preference** — Where to run? (local only, AWS later, AWS now)
 
-Skip questions that don't apply based on the sample analysis. For example, if `text_search_required=false`, skip semantic search options.
+Skip questions that don't apply based on the sample analysis.
 
 ### Phase 3 — Plan
 
-**Tools:** `start_planning()`, `refine_plan(user_feedback)`, `finalize_plan()`
+Based on sample data and preferences, design a search architecture. Present it to the user including:
 
-1. Call `start_planning()` — the planner sub-agent analyzes the sample and preferences, then proposes a search architecture.
-2. Present the proposal **verbatim** to the user.
-3. If the user wants changes, call `refine_plan(user_feedback)` with their feedback.
-4. Once the user approves, call `finalize_plan()`.
+- **Search strategy**: One of `bm25`, `dense_vector`, `neural_sparse`, `hybrid`, `agentic`
+- **Index configuration**: Mappings with appropriate field types and vector fields
+- **ML model** (if needed): Which model and why
+- **Ingest pipeline** (if needed): Processor chain for embeddings
+- **Search capabilities**: What users will be able to search for
 
-If `start_planning()` returns `manual_planning_required=true`, drive the planning manually using `set_plan_from_planning_complete`.
+**Reference files for planning** (read with `read-knowledge`):
+- `dense_vector_models.md` — Available dense vector models and dimensions
+- `sparse_vector_models.md` — Available sparse/neural-sparse models
+- `opensearch_semantic_search_guide.md` — Semantic search patterns
+- `agentic_search_guide.md` — Agentic search setup
 
-The planner produces a structured architecture covering:
-- Retrieval strategy (BM25, semantic, hybrid, agentic)
-- Index variant and field mappings
-- Model deployment options (local pretrained, Bedrock, SageMaker)
-- Pipeline configuration
+Wait for user approval before proceeding to execution.
 
 ### Phase 4 — Execute
 
-**Tools:** `execute_plan()`, `retry_execution()`
+Execute the plan step by step. The exact steps depend on the search strategy:
 
-1. Call `execute_plan()` — the worker sub-agent creates all OpenSearch resources:
-   - Index with configured mappings
-   - ML model (if semantic/hybrid/agentic)
-   - Ingest pipeline
-   - Verification documents
-   - Local search UI at `http://127.0.0.1:8765`
-2. If execution fails, present the error and let the user fix the issue, then call `retry_execution()`.
+#### BM25 (keyword search)
+1. Create index with text field mappings
+2. Index verification documents
+3. Test with a keyword search
+4. Launch UI
+
+#### Dense Vector
+1. Deploy embedding model:
+   ```bash
+   uv run python scripts/opensearch_ops.py deploy-model --name "huggingface/sentence-transformers/all-MiniLM-L6-v2"
+   ```
+2. Create index with `knn_vector` fields
+3. Create ingest pipeline with `text_embedding` processor
+4. Index verification documents
+5. Test with a semantic search (k-NN query)
+6. Launch UI
+
+#### Neural Sparse
+1. Deploy sparse model:
+   ```bash
+   uv run python scripts/opensearch_ops.py deploy-model --name "amazon/neural-sparse/opensearch-neural-sparse-encoding-doc-v3-gte"
+   ```
+2. Create index with `rank_features` fields
+3. Create ingest pipeline with `sparse_encoding` processor
+4. Index verification documents
+5. Test with a neural sparse query
+6. Launch UI
+
+#### Hybrid (BM25 + dense/sparse vector)
+1. Deploy model(s)
+2. Create index with both text and vector fields
+3. Create ingest pipeline
+4. Create search pipeline with normalization (use `--hybrid` flag):
+   ```bash
+   uv run python scripts/opensearch_ops.py create-pipeline --name my-search-pipeline --body '{}' --index my-index --type search --hybrid --weights '[0.3, 0.7]'
+   ```
+5. Index verification documents
+6. Test with a hybrid query
+7. Launch UI
+
+#### Agentic
+Follow the agentic search guide: `read-knowledge --file agentic_search_guide.md`
+
+#### Common final steps
+After execution, launch the Search Builder UI:
+```bash
+uv run python scripts/opensearch_ops.py launch-ui --index my-index
+```
+
+Verify by running test searches:
+```bash
+uv run python scripts/opensearch_ops.py search --index my-index --body '{"query":{"match":{"title":"example"}}}'
+```
 
 ### Phase 5 — Deploy to AWS (Optional)
 
-**Tool:** `prepare_aws_deployment()`
+Only if the user wants AWS deployment. The deployment path depends on the search strategy:
 
-This phase is optional. Only proceed if the user wants to deploy to AWS.
+| Strategy | Target | Guide |
+|---|---|---|
+| `neural_sparse` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy: Neural Sparse Path](references/aws-serverless-02-deploy-search.md) |
+| `dense_vector` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy: Dense Vector Path](references/aws-serverless-02-deploy-search.md) |
+| `hybrid` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy: Dense Vector Path](references/aws-serverless-02-deploy-search.md) |
+| `bm25` | serverless | [Provision](references/aws-serverless-01-provision.md) then [Deploy: BM25 Path](references/aws-serverless-02-deploy-search.md) |
+| `agentic` | domain | [Provision](references/aws-domain-01-provision.md) then [Deploy](references/aws-domain-02-deploy-search.md) then [Agentic Setup](references/aws-domain-03-agentic-setup.md) |
 
-Calling `prepare_aws_deployment()` returns:
-- `deployment_target` — "serverless" or "domain"
-- Steering file references for the deployment track
-- State template for tracking deployment progress
+**Required tools for AWS deployment:**
+- AWS CLI (`aws`) or MCP servers: `awslabs.aws-api-mcp-server`, `opensearch-mcp-server`
+- `aws-knowledge-mcp-server` (`uvx fastmcp run https://knowledge-mcp.global.api.aws`) for AOSS deployment
 
-**Required additional MCP servers for AWS deployment:**
-- `awslabs.aws-api-mcp-server`
-- `opensearch-mcp-server`
-- `awslabs.aws-documentation-mcp-server` (recommended)
+**AOSS (Serverless) constraints:**
+- No document-by-ID operations — use `POST /<index>/_doc` (auto-generated IDs only)
+- No `_cat` APIs and no `GET /` endpoint
+- SEARCH collections: ~10s refresh latency; VECTORSEARCH: ~30s
+- Shard metadata shows 0 in responses (normal)
+- For `neural_sparse`: use automatic semantic enrichment — no manual model/pipeline needed
 
-**Follow the appropriate deployment guide:**
-- **OpenSearch Serverless** — For semantic, hybrid, BM25 workloads with auto-scaling. See [Serverless Provision](references/aws-serverless-01-provision.md) then [Serverless Deploy Search](references/aws-serverless-02-deploy-search.md).
-- **OpenSearch Domain** — For agentic search, advanced plugins, fine-grained control. See [Domain Provision](references/aws-domain-01-provision.md), then [Domain Deploy Search](references/aws-domain-02-deploy-search.md), then [Domain Agentic Setup](references/aws-domain-03-agentic-setup.md) if agentic.
+After deployment, connect the Search Builder UI:
+```bash
+uv run python scripts/opensearch_ops.py connect-ui \
+  --endpoint search-my-domain.us-east-1.es.amazonaws.com \
+  --aws-region us-east-1 \
+  --aws-service aoss \
+  --index my-index
+```
 
-For cost, security, HA, and troubleshooting details, see [AWS Reference](references/aws-reference.md).
-
-After deployment, connect the local Search Builder UI to the AWS endpoint using `connect_search_ui_to_endpoint()`.
-
-## Available MCP Tools Summary
-
-| Tool | Phase | Purpose |
-|------|-------|---------|
-| `load_sample` | 1 | Load a sample document |
-| `set_preferences` | 2 | Set user preferences |
-| `start_planning` | 3 | Begin architecture planning |
-| `refine_plan` | 3 | Refine the proposed plan |
-| `finalize_plan` | 3 | Lock in the final plan |
-| `set_plan_from_planning_complete` | 3 | Manual planning fallback |
-| `execute_plan` | 4 | Execute the finalized plan |
-| `retry_execution` | 4 | Retry after a failure |
-| `prepare_aws_deployment` | 5 | Start AWS deployment |
-| `connect_search_ui_to_endpoint` | 5 | Point UI to AWS endpoint |
+For cost, security, HA, and troubleshooting, see [AWS Reference](references/aws-reference.md).
