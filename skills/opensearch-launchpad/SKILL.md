@@ -1,5 +1,5 @@
 ---
-name: opensearch-search-builder
+name: opensearch-launchpad
 description: >
   Build search applications with OpenSearch. Guides you through setting up
   semantic search, vector search, hybrid search, neural search, BM25, dense
