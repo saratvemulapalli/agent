@@ -1,5 +1,6 @@
 {
   "name": "opensearch-launchpad",
+  "displayName": "OpenSearch Launchpad",
   "version": "0.1.2",
   "description": "MCP-powered OpenSearch solution architect: collect a sample document, gather preferences, plan search architecture, provision indices/models/pipelines, launch a local Search UI, and optionally prepare AWS deployment.",
   "author": {
