@@ -2,6 +2,16 @@
 
 An MCP-powered assistant that guides you from initial requirements to a running OpenSearch search setup. It collects a sample document, gathers preferences, plans a search architecture, and executes the plan — creating indices, ML models, ingest pipelines, and a local search UI — with optional deployment to Amazon OpenSearch Service or Serverless.
 
+The package is built from **`opensearch_orchestrator`** and is distributed for:
+
+| Platform | Location | Purpose |
+|----------|----------|---------|
+| **Kiro** | `kiro/opensearch-launchpad/` | Kiro Power (workflow + MCP config) |
+| **Claude** | `.claude/skills/` → `../skills` | Claude Agent Skill (symlink) |
+| **Cursor** | `cursor/` (template); plugin at `cursor/plugins/opensearch-launchpad/` | Cursor plugin (Agent Skill only; no MCP) |
+
+See [cursor/README.md](cursor/README.md) and [cursor/plugins/opensearch-launchpad/README.md](cursor/plugins/opensearch-launchpad/README.md) for the Cursor plugin layout and installation.
+
 ---
 
 ## Kiro Power (Primary Integration)
@@ -19,10 +29,11 @@ multiple IDEs. The skill lives in `skills/opensearch-launchpad/` with symlinks
 for each IDE's discovery path:
 
 ```
-skills/opensearch-launchpad/    # Source of truth
-.claude/skills -> ../skills     # Claude Code + Cursor
-.cursor/skills -> ../skills     # Cursor (explicit)
-.kiro/skills   -> ../skills     # Kiro
+skills/opensearch-launchpad/              # Source of truth
+.claude/skills -> ../skills               # Claude Code
+.cursor/skills -> ../skills               # Cursor (project-level)
+.kiro/skills   -> ../skills               # Kiro
+cursor/plugins/opensearch-launchpad/skills -> ../../../skills   # Cursor plugin
 ```
 
 ### Claude Code
@@ -66,8 +77,7 @@ For AWS deployment (Phase 5), add these MCP servers to `.mcp.json`:
 2. Open the project in Cursor — the skill is discovered from `.cursor/skills/opensearch-launchpad/SKILL.md`.
 
 Same as Claude Code: the agent follows the skill instructions and runs scripts
-directly. No custom MCP server. For AWS deployment, add the same MCP servers
-to `.cursor/mcp.json`.
+directly. **No MCP server needed** for the core workflow. For AWS deployment (Phase 5), add the same optional MCP servers to `.cursor/mcp.json` as in the Claude section above.
 
 ### Kiro
 
