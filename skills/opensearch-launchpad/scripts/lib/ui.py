@@ -1,6 +1,8 @@
 """Search Builder UI server for Agent Skills standalone path.
 
 Serves the static React frontend and proxies search requests to OpenSearch.
+Matches the MCP path's full-featured search UI with smart field detection,
+semantic/hybrid search, agentic search, suggestions, and autocomplete.
 """
 
 import json
@@ -15,6 +17,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .client import create_client, can_connect, build_client, resolve_http_auth
+from .search import (
+    autocomplete,
+    extract_index_field_specs,
+    generate_suggestions,
+    search_ui_search,
+)
 
 SEARCH_UI_HOST = os.getenv("SEARCH_UI_HOST", "127.0.0.1")
 SEARCH_UI_PORT = int(os.getenv("SEARCH_UI_PORT", "8765"))
@@ -72,6 +80,7 @@ class _UIHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
@@ -85,15 +94,74 @@ class _UIHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
 
         # Health check
-        if parsed.path == "/_health":
-            self._send_json({"status": "ok", "default_index": _default_index})
+        if parsed.path in ("/_health", "/api/health"):
+            backend = _get_backend_info()
+            self._send_json({
+                "ok": True,
+                "status": "running",
+                "default_index": _default_index,
+                "pid": os.getpid(),
+                "backend_type": backend["backend_type"],
+                "endpoint": backend["endpoint"],
+                "connected": backend["connected"],
+            })
+            return
+
+        # Config
+        if parsed.path == "/api/config":
+            backend = _get_backend_info()
+            self._send_json({
+                "default_index": _default_index,
+                "backend_type": backend["backend_type"],
+                "endpoint": backend["endpoint"],
+                "connected": backend["connected"],
+            })
+            return
+
+        # Suggestions
+        if parsed.path == "/api/suggestions":
+            index_name = (params.get("index") or [""])[0] or _default_index
+            try:
+                client = _get_client()
+                suggestions = generate_suggestions(client, index_name, max_count=6)
+                self._send_json({
+                    "suggestions": suggestions,
+                    "index": index_name,
+                })
+            except Exception as e:
+                self._send_json({"suggestions": [], "index": index_name, "error": str(e)})
+            return
+
+        # Autocomplete
+        if parsed.path == "/api/autocomplete":
+            index_name = (params.get("index") or [""])[0] or _default_index
+            prefix_text = (params.get("q") or [""])[0]
+            field_name = (params.get("field") or [""])[0]
+            try:
+                ac_size = int((params.get("size") or ["8"])[0])
+            except ValueError:
+                ac_size = 8
+            ac_size = max(1, min(ac_size, 20))
+            try:
+                client = _get_client()
+                result = autocomplete(
+                    client, index_name, prefix_text,
+                    size=ac_size, preferred_field=field_name,
+                )
+                self._send_json(result)
+            except Exception as e:
+                self._send_json({
+                    "index": index_name, "prefix": prefix_text,
+                    "field": "", "options": [], "error": str(e),
+                })
             return
 
         # Search API
         if parsed.path == "/api/search":
-            self._handle_search(parse_qs(parsed.query))
+            self._handle_search(params)
             return
 
         # Static file
@@ -124,7 +192,15 @@ class _UIHandler(BaseHTTPRequestHandler):
     def _handle_search(self, params: dict):
         query = (params.get("q") or params.get("query") or [""])[0]
         index = (params.get("index") or [_default_index])[0] or _default_index
-        size = int((params.get("size") or ["10"])[0])
+        search_intent = (params.get("intent") or [""])[0]
+        field_hint = (params.get("field") or [""])[0]
+        debug_param = (params.get("debug") or ["0"])[0].strip().lower()
+        debug_mode = debug_param in {"1", "true", "yes", "on"}
+        try:
+            size = int((params.get("size") or ["20"])[0])
+        except ValueError:
+            size = 20
+        size = max(1, min(size, 50))
 
         if not index:
             self._send_json({"error": "No index specified."}, 400)
@@ -132,24 +208,73 @@ class _UIHandler(BaseHTTPRequestHandler):
 
         try:
             client = _get_client()
-            body = {"query": {"multi_match": {"query": query, "fields": ["*"]}}, "size": size}
-            result = client.search(index=index, body=body)
+            result = search_ui_search(
+                client=client,
+                index_name=index,
+                query_text=query,
+                size=size,
+                debug=debug_mode,
+                search_intent=search_intent,
+                field_hint=field_hint,
+            )
             self._send_json(result)
         except Exception as e:
-            self._send_json({"error": str(e)}, 500)
+            self._send_json({
+                "error": str(e),
+                "hits": [], "took_ms": 0,
+                "query_mode": "", "capability": "",
+                "used_semantic": False, "fallback_reason": "",
+            }, status=500)
 
     def _handle_search_post(self, body: dict):
         index = body.pop("index", _default_index) or _default_index
-        size = body.pop("size", 10)
+        size = body.pop("size", 20)
         if not index:
             self._send_json({"error": "No index specified."}, 400)
             return
         try:
             client = _get_client()
-            result = client.search(index=index, body=body, size=size)
-            self._send_json(result)
+            # If the POST body has a "query" key, treat as raw DSL pass-through
+            if "query" in body:
+                result = client.search(index=index, body=body, size=size)
+                self._send_json(result)
+            else:
+                # Otherwise treat as a structured search request
+                query_text = body.get("q", body.get("query_text", ""))
+                debug = body.get("debug", False)
+                result = search_ui_search(
+                    client=client,
+                    index_name=index,
+                    query_text=query_text,
+                    size=size,
+                    debug=debug,
+                )
+                self._send_json(result)
         except Exception as e:
             self._send_json({"error": str(e)}, 500)
+
+
+def _get_backend_info() -> dict:
+    override = _endpoint_override
+    if override.get("host"):
+        endpoint = override["host"]
+        backend_type = "aws" if override.get("aws_region") else "remote"
+        try:
+            client = _get_client()
+            ok, _ = can_connect(client)
+            connected = ok
+        except Exception:
+            connected = False
+        return {"backend_type": backend_type, "endpoint": endpoint, "connected": connected}
+    from .client import OPENSEARCH_HOST, OPENSEARCH_PORT
+    endpoint = f"{OPENSEARCH_HOST}:{OPENSEARCH_PORT}"
+    try:
+        client = _get_client()
+        ok, _ = can_connect(client)
+        connected = ok
+    except Exception:
+        connected = False
+    return {"backend_type": "local", "endpoint": endpoint, "connected": connected}
 
 
 def launch_ui(index_name: str = "") -> str:
